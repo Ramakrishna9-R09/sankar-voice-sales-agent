@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#f4f5f7" />
+  <meta name="description" content="A focused AI sales conversation workspace by Sankar Group." />
+  <title>Sankar Voice — AI Sales Workspace</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+  <link rel="stylesheet" href="./premium.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#" aria-label="Sankar Voice home"><span class="brand-symbol"><i></i><i></i><i></i></span><span>SANKAR<span class="brand-light">VOICE</span></span></a>
+      <div class="workspace-switch"><div class="workspace-avatar">SG</div><div class="workspace-meta"><strong>Sankar Group</strong><span>Sales workspace</span></div><span class="switch-chevron">⌄</span></div>
+      <div class="nav-label">WORKSPACE</div>
+      <nav class="primary-nav"><a class="nav-link selected" href="#workspace"><span class="nav-glyph">◈</span><span class="nav-copy">Live workspace</span></a><a class="nav-link" href="#history"><span class="nav-glyph">▤</span><span class="nav-copy">Conversations</span><span class="nav-counter" id="nav-count">0</span></a></nav>
+      <div class="sidebar-rule"></div>
+      <div class="section-label"><span>RECENT CONVERSATIONS</span><button id="clear-history" class="quiet-button">Clear</button></div>
+      <div id="recent-list" class="recent-list"><div class="recent-empty">Calls you finish will appear here.</div></div>
+      <div class="sidebar-bottom"><div class="privacy-note"><span class="privacy-icon">⌑</span><div><strong>Private by design</strong><p>Recordings stay in this browser.</p></div></div><div class="workspace-user"><span class="user-avatar">S</span><div><strong>Sankar Group</strong><span>Administrator</span></div><button aria-label="More account options">···</button></div></div>
+    </aside>
+
+    <main class="main-area" id="workspace">
+      <header class="topbar"><div class="breadcrumbs"><span>Sales</span><b>/</b><strong>Live workspace</strong></div><div class="topbar-actions"><span class="environment-label"><i></i><span id="connection-label">Checking AI service</span></span><button class="icon-button" id="settings-open" title="Settings" aria-label="Settings">⚙</button><div class="top-user">S</div></div></header>
+      <div class="page-wrap">
+        <section class="page-heading"><div><div class="overline"><span class="overline-dash"></span> AI CONVERSATION STUDIO</div><h1>Good conversations<br class="mobile-only" /> move business forward<span class="heading-period">.</span></h1><p>Listen well. Understand what matters. Make the next step feel natural.</p></div><div class="heading-date"><span>◷</span><strong id="today-date"></strong></div></section>
+
+        <section class="workspace-grid" aria-label="Live voice sales workspace">
+          <section class="call-panel">
+            <div class="panel-top"><div><div class="panel-overline">VOICE SALES ASSISTANT</div><div class="panel-title-row"><h2>Discovery call</h2><span class="session-label">SESSION 01</span></div></div><div class="session-state" id="session-state"><span class="state-dot"></span><span id="state-label">READY</span></div></div>
+            <div class="prospect-strip"><div class="prospect-avatar" id="prospect-avatar">P</div><div class="prospect-info"><span>PROSPECT</span><strong id="prospect-name">New conversation</strong></div><div class="strip-divider"></div><div class="product-info"><span>PRODUCT</span><strong id="product-name">Nexus CRM</strong></div><button class="edit-button" id="edit-details" aria-label="Edit prospect and product">✎ <span>Edit</span></button></div>
+
+            <div class="assistant-stage" id="assistant-stage"><div class="stage-topline"><span><i class="secure-mini">⌑</i> <span id="stage-caption">Ready to start when you are</span></span><span class="timer" id="call-timer">00:00</span></div><div class="voice-visual"><div class="voice-rings ring-outer"></div><div class="voice-rings ring-middle"></div><div class="voice-rings ring-inner"></div><div class="voice-orb"><span class="orb-mark">S</span><span class="orb-wave" id="orb-wave"><i></i><i></i><i></i><i></i><i></i></span></div></div><div class="voice-state-copy"><strong id="voice-state">Your AI sales assistant</strong><span id="voice-substate">A calm, helpful conversation starts here.</span></div></div>
+
+            <div class="transcript-top"><div><span class="transcript-heading">LIVE TRANSCRIPT</span><span class="transcript-live" id="transcript-live" hidden><i></i> LIVE</span></div><button id="transcript-copy" class="copy-button" disabled>Copy transcript</button></div>
+            <div class="transcript-feed" id="conversation" aria-live="polite" aria-label="Live call transcript"><div class="transcript-empty"><div class="empty-symbol">↳</div><strong>The conversation will show up here</strong><p>Start a call. You and your AI assistant will see every turn, as it happens.</p></div></div>
+            <div class="call-controls"><div class="record-control"><label class="consent-check"><input type="checkbox" id="record-consent" /><span class="checkmark"></span></label><div class="record-copy"><strong>Record this call</strong><span>I have the prospect’s permission to record</span></div><span class="record-lock" title="Stored only in this browser">⌑</span></div><div class="control-actions"><button id="start-call" class="start-button"><span class="start-glyph">●</span> Start call</button><button id="end-call" class="end-button" disabled><span>■</span> End call</button></div></div>
+            <div class="call-message" id="call-notice" hidden></div>
+          </section>
+
+          <aside class="insight-rail">
+            <section class="rail-card setup-card" id="setup-card"><div class="rail-head"><span class="rail-icon violet">✳</span><div class="rail-title"><span>AI ENGINE</span><strong id="engine-title">Connecting to AI</strong></div><button class="inline-link" id="setup-link">Setup <span>↗</span></button></div><p id="engine-description">Checking your server configuration.</p><div class="engine-tags"><span><i class="tag-dot"></i> Conversation AI</span><span><i class="tag-dot"></i> Voice synthesis</span></div></section>
+            <section class="rail-card details-card"><div class="rail-heading"><span>CALL BRIEF</span><button id="brief-edit" class="tiny-icon" title="Edit call brief">✎</button></div><div class="brief-goal"><span class="goal-icon">◎</span><div><span>CONVERSATION GOAL</span><strong id="goal-value">Understand their needs</strong></div></div><div class="brief-product"><span>Prospect context is applied to each AI turn</span></div></section>
+            <section class="rail-card summary-card"><div class="rail-heading"><span>POST-CALL INTELLIGENCE</span><span class="rail-count" id="summary-state">AFTER CALL</span></div><div class="summary-body" id="summary-content"><div class="summary-empty"><div class="summary-graphic"><i>✳</i><span></span><span></span><span></span></div><strong>Clarity after every call.</strong><p>Needs, objections, buying signals and a practical next step — captured automatically.</p></div></div></section>
+            <section class="rail-card outcome-card"><div class="rail-heading"><span>LEAD OUTCOME</span><span class="outcome-mini">AUTO-CLASSIFIED</span></div><div id="sales-status" class="outcome-placeholder"><span class="outcome-mark">—</span><div><strong>Awaiting conversation</strong><p>Your AI will recommend a sales status.</p></div></div></section>
+            <div class="coaching-note"><span class="coach-icon">✦</span><div><span>SALES NOTE</span><p>Ask one thing at a time. The best answers come when prospects feel heard.</p></div></div>
+          </aside>
+        </section>
+
+        <section class="history-section" id="history"><div class="history-head"><div><div class="overline"><span class="overline-dash"></span> YOUR PIPELINE, IN CONTEXT</div><h2>Conversation history <span id="history-count" class="history-count">0</span></h2><p>Every conversation, with its signal and next step.</p></div><div class="history-toolbar"><label class="search-box"><span>⌕</span><input id="history-search" type="search" placeholder="Search conversations" /></label><select id="history-filter" aria-label="Filter conversations"><option value="all">All outcomes</option><option>Converted</option><option>Interested</option><option>Follow-up Required</option><option>Not Interested</option><option>Demo Requested</option><option>No Response</option></select></div></div><div id="history-cards" class="history-list"><div class="history-empty"><div class="history-empty-icon">▤</div><strong>No conversations yet</strong><p>Once you finish a call, its recording, transcript, summary and outcome will be saved here.</p></div></div></section>
+        <footer class="app-footer"><span>SANKAR GROUP <i>·</i> INTERN PROJECT</span><span><i class="footer-secure">⌑</i> Data stored locally in this browser</span></footer>
+      </div>
+    </main>
+  </div>
+
+  <div class="modal-layer" id="details-modal" hidden><div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="details-title"><button class="modal-x" data-close="details-modal" aria-label="Close">×</button><div class="modal-kicker">CONVERSATION SETUP</div><h2 id="details-title">Give your assistant the context.</h2><p>A little preparation makes every question more relevant.</p><label>Prospect name<input id="input-prospect" placeholder="e.g. Priya Sharma" /></label><label>Product or service<input id="input-product" placeholder="e.g. Nexus CRM" /></label><label>What should the call uncover?<textarea id="input-goal" rows="2" placeholder="e.g. Their sales process, team size and biggest bottleneck"></textarea></label><div class="modal-footer"><button class="button-quiet" data-close="details-modal">Cancel</button><button id="save-details" class="button-primary">Save conversation brief <span>↗</span></button></div></div></div>
+  <div class="modal-layer" id="settings-modal" hidden><div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="settings-title"><button class="modal-x" data-close="settings-modal" aria-label="Close">×</button><div class="modal-kicker">SERVER CONFIGURATION</div><h2 id="settings-title">Connect your AI engine.</h2><p>The API key belongs on the server, never in this browser. Add it to the project’s <code>.env</code> file and restart the server.</p><div class="setup-steps"><div><span>01</span><p>Create a Groq API key in your account.</p></div><div><span>02</span><p>Copy <code>.env.example</code> to <code>.env</code> and set <code>GROQ_API_KEY</code>.</p></div><div><span>03</span><p>Restart <code>npm run dev</code>. This panel updates automatically.</p></div></div><a class="docs-link" href="https://console.groq.com/keys" target="_blank" rel="noopener noreferrer">Open Groq API keys <span>↗</span></a><div class="modal-footer"><button class="button-primary" data-close="settings-modal">Got it</button></div></div></div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="./app.js" defer></script>
+</body>
+</html>
