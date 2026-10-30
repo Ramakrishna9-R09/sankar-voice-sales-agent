@@ -75,6 +75,7 @@ async function groq(pathname, payload, { accept = 'application/json', signal, re
           const retryAfter = Number(result.headers.get('retry-after'));
           if (retryAfter) error.retryAfterMs = Math.min(3000, retryAfter * 1000);
           if ([408, 425, 429, 500, 502, 503, 504].includes(result.status)) groqCircuit.failure();
+          else groqCircuit.success(); // Any non-transient response completes a half-open probe and prevents a stuck breaker.
           logEvent('groq_http_error', { request_id: requestId, path: pathname, status: result.status, attempt });
           throw error;
         }

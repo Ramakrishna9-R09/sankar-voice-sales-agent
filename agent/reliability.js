@@ -35,7 +35,7 @@ export class CircuitBreaker {
   snapshot() { return { state: this.state, failures: this.failures, retry_in_ms: Math.max(0, this.openUntil - this.now()) }; }
 }
 
-const transient = (error) => error?.name === 'TimeoutError' || error?.name === 'TypeError' || [408, 425, 429, 500, 502, 503, 504].includes(error?.status);
+const transient = (error) => error?.name !== 'CircuitOpenError' && (error?.name === 'TimeoutError' || error?.name === 'TypeError' || [408, 425, 429, 500, 502, 503, 504].includes(error?.status));
 
 export async function retryTransient(operation, { retries = 2, signal, onRetry = () => {} } = {}) {
   let lastError;

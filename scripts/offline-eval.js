@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { classifyIntent, nextStage } from '../agent/stages.js';
 import { normalizeEvaluation, talkListenRatio } from '../agent/evaluation.js';
 import { validateToolArguments, validateToolResult } from '../agent/tools.js';
-import { CircuitBreaker } from '../agent/reliability.js';
+import { CircuitBreaker, retryTransient } from '../agent/reliability.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const fixturePath = path.resolve(process.argv[2] && process.argv[2] !== '--rescore' ? process.argv[2] : path.join(root, 'eval', 'fixtures.json'));
@@ -26,6 +26,9 @@ breaker.assertAvailable();
 assert.equal(breaker.state, 'half-open', 'cooldown should allow a half-open probe');
 breaker.success();
 assert.equal(breaker.state, 'closed', 'successful probe should close the circuit');
+let openCircuitAttempts = 0;
+await assert.rejects(() => retryTransient(() => { openCircuitAttempts += 1; const error = new Error('open'); error.name = 'CircuitOpenError'; error.status = 503; throw error; }, { retries: 2 }));
+assert.equal(openCircuitAttempts, 1, 'an open circuit should fail fast without consuming retry attempts');
 
 const results = [];
 for (const fixture of fixtures) {

@@ -216,7 +216,7 @@ import { EnergyVAD } from './voice-activity.js';
     state.vad = new EnergyVAD({
       onSpeechStart: () => {
         setVADActive(true);
-        if (state.speaking) interruptAssistant();
+        if (state.speaking || state.thinking) interruptAssistant();
       },
       onSpeechEnd: () => {
         setVADActive(false);
@@ -361,7 +361,10 @@ import { EnergyVAD } from './voice-activity.js';
       if (error.name !== 'AbortError' && state.callMetrics) state.callMetrics.errors += 1;
       if (error.name === 'AbortError' && state.callMetrics) state.callMetrics.interruptions += 1;
       if (error.name !== 'AbortError' && turnId === state.turnSequence && state.active) {
-        if (!state.streamMessage) addMessage('assistant', 'I’m sorry, I’m having trouble connecting right now. Could you repeat that in a moment, or would you prefer a follow-up?');
+        const fallback = 'I’m sorry, I’m having trouble connecting right now. Could you repeat that in a moment, or would you prefer a follow-up?';
+        state.streamMessage = null;
+        addMessage('assistant', fallback);
+        enqueueSpeech(fallback, null);
         showNotice(`AI response failed: ${error.message}`); toast('The AI response could not be completed. You can try speaking again.');
       }
     } finally {
