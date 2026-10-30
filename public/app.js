@@ -537,6 +537,7 @@ import { EnergyVAD } from './voice-activity.js';
       messages: cleanMessages, summary, actions: state.toolActions, metrics: state.callMetrics, status: summary.status, audio: audioSaved
     };
     state.calls.unshift(call); saveCalls(); renderHistory(); renderRecent();
+    void refreshMetrics();
     state.ending = false; $('#start-call').disabled = false; $('#state-label').textContent = 'READY';
     setVoiceState('ready'); $('#stage-caption').textContent = audioSaved ? 'Call and recording saved on this device' : 'Call transcript and analysis saved';
     if (!silent) toast(audioSaved ? 'Call recording, transcript, and analysis saved.' : 'Call transcript and analysis saved.');
@@ -589,7 +590,7 @@ import { EnergyVAD } from './voice-activity.js';
       const toolCalls = tools.reduce((sum, item) => sum + item.calls, 0);
       const toolErrors = tools.reduce((sum, item) => sum + item.errors, 0);
       const toolSuccess = toolCalls ? `${Math.round((toolCalls - toolErrors) / toolCalls * 100)}%` : '—';
-      host.innerHTML = `<div class="ops-metric"><span>Time to first token · p50</span><strong>${fmt(metrics.voice?.time_to_first_token_ms?.p50_ms)}</strong></div><div class="ops-metric"><span>Time to first audio · p50</span><strong>${fmt(metrics.voice?.time_to_first_audio_ms?.p50_ms)}</strong></div><div class="ops-metric"><span>Turn latency · p95</span><strong>${fmt(metrics.turns?.p95_ms)}</strong></div><div class="ops-metric"><span>Groq request errors</span><strong>${Math.round((metrics.groq?.error_rate || 0) * 100)}%</strong></div><div class="ops-metric"><span>Tool success rate</span><strong>${toolSuccess}</strong></div><div class="ops-metric"><span>Tokens · input / output</span><strong>${Number(metrics.groq?.input_tokens || 0).toLocaleString()} / ${Number(metrics.groq?.output_tokens || 0).toLocaleString()}</strong></div>`;
+      host.innerHTML = `<div class="ops-metric"><span>Time to first token · p50</span><strong>${fmt(metrics.voice?.time_to_first_token_ms?.p50_ms)}</strong></div><div class="ops-metric"><span>Time to first audio · p50</span><strong>${fmt(metrics.voice?.time_to_first_audio_ms?.p50_ms)}</strong></div><div class="ops-metric"><span>Turn latency · p95</span><strong>${fmt(metrics.turns?.p95_ms)}</strong></div><div class="ops-metric"><span>Turn error rate</span><strong>${Math.round((metrics.turns?.error_rate || 0) * 100)}%</strong></div><div class="ops-metric"><span>Groq request errors</span><strong>${Math.round((metrics.groq?.error_rate || 0) * 100)}%</strong></div><div class="ops-metric"><span>Tool success · calls</span><strong>${toolSuccess} · ${toolCalls} <small>(${toolErrors} failed)</small></strong></div><div class="ops-metric"><span>Tokens · input / output</span><strong>${Number(metrics.groq?.input_tokens || 0).toLocaleString()} / ${Number(metrics.groq?.output_tokens || 0).toLocaleString()}</strong></div>`;
       $('#metrics-scope').textContent = `${metrics.scope || 'Instance-local'} · circuit ${metrics.circuit?.state || 'unknown'} · window resets after 15 minutes.`;
     } catch {
       host.innerHTML = '<div class="ops-metric"><span>Runtime telemetry</span><strong>Unavailable</strong></div>';

@@ -6,6 +6,7 @@ import { classifyIntent, nextStage } from '../agent/stages.js';
 import { normalizeEvaluation, talkListenRatio } from '../agent/evaluation.js';
 import { validateToolArguments, validateToolResult } from '../agent/tools.js';
 import { CircuitBreaker, retryTransient } from '../agent/reliability.js';
+import { rankSemanticFacts } from '../public/memory.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const fixturePath = path.resolve(process.argv[2] && process.argv[2] !== '--rescore' ? process.argv[2] : path.join(root, 'eval', 'fixtures.json'));
@@ -17,6 +18,12 @@ if (!Array.isArray(fixtures) || fixtures.length === 0) throw new Error('Evaluati
 assert.equal(validateToolArguments('calculate_pricing', { product: 'Example SaaS', quantity: 2 }).ok, true, 'valid quote arguments should pass');
 assert.equal(validateToolArguments('calculate_pricing', { product: 'Example SaaS', total: 1 }).ok, false, 'model-supplied quote totals must be rejected');
 assert.equal(validateToolResult('schedule_followup', { booked: 'yes' }).ok, false, 'malformed scheduling results must be rejected');
+const memoryNow = Date.now();
+const rankedFacts = rankSemanticFacts([
+  { type: 'need', value: 'workflow reporting', importance: 0.8, confidence: 0.3, last_seen_at: memoryNow },
+  { type: 'need', value: 'workflow reporting', importance: 0.8, confidence: 0.95, last_seen_at: memoryNow }
+], 'workflow', memoryNow);
+assert.equal(rankedFacts[0].confidence, 0.95, 'higher-confidence facts should win ties in relevance and importance');
 let clock = 1000;
 const breaker = new CircuitBreaker({ threshold: 2, cooldownMs: 500, now: () => clock });
 breaker.failure(); breaker.failure();

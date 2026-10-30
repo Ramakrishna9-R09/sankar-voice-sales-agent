@@ -26,6 +26,15 @@ flowchart LR
 
 The browser owns the live audio and local call archive. The server owns provider credentials, tool validation, product facts, retries, and evaluation. No transcript, recording, or prospect memory is sent to the metrics logger.
 
+### Design decisions
+
+- **Parallel reads, ordered writes:** independent catalog lookups and quotes may run concurrently; follow-up, lead updates, and call-ending actions stay ordered to avoid side effects racing each other.
+- **Bounded agent loop:** at most three tool-bearing generations are allowed before a final answer generation. This limits cost and protects the UI from an unproductive tool cycle.
+- **Local memory and recording:** IndexedDB keeps the demo deployable without a database and gives the operator control of browser-local data. It also means data does not sync across devices and is not suitable for shared production workspaces.
+- **Acoustic VAD:** adaptive RMS detection and a short hangover give low-latency barge-in without shipping a large model. It is less robust than a neural detector in noisy rooms.
+- **Process-local telemetry:** an in-memory rolling window is simple and Vercel-compatible, but it is diagnostic only; serverless instances do not share counters.
+- **Webhook integrations:** adapters avoid binding the agent core to a specific CRM or calendar SDK. The external service owns authentication, durable scheduling, and idempotent processing.
+
 ## Run locally
 
 Requirements: Node.js 20+, a Groq API key, and Chrome or Edge for Web Speech recognition.
@@ -74,8 +83,8 @@ Audio is mixed and recorded in-browser only when the operator confirms prospect 
 ## Memory and privacy
 
 - Short-term memory is the current transcript, bounded to 80 messages.
-- Semantic facts (needs, preferences, objections, company, outcomes) have importance and confidence values, are ranked by query relevance, and decay over time.
-- Episodic memory stores a compact summary/status/next-step record per call and is separately ranked and decayed.
+- Semantic facts (needs, preferences, objections, company, outcomes) have importance and heuristic confidence values. Retrieval ranks by query relevance, decayed importance, and confidence, then injects the strongest bounded set into the prompt. Confidence is a ranking hint, not a calibrated probability.
+- Episodic memory stores a compact summary/status/next-step record per call, with separate importance/confidence ranking and a slower decay curve.
 - The previous IndexedDB profile format is migrated lazily. Memory is local to the browser and is not a secure multi-user database.
 
 ## Evaluation and analytics
@@ -88,13 +97,13 @@ Run the deterministic, no-network regression suite:
 npm run eval:offline
 ```
 
-For LLM judge replay of saved call-shaped JSON fixtures, start the app with a configured Groq key and run `npm run eval:offline -- --rescore` (optionally pass a fixture path after the flag). Set `EVAL_BASE_URL` to target another deployment. The report is written to `eval/latest-report.json` (override with `EVAL_OUTPUT`). In `--rescore` mode, transcripts are sent to the configured Groq evaluation endpoint.
+The default command runs deterministic no-network checks for intent/stage decisions, tool schemas, memory ranking, talk/listen math, and circuit-breaker transitions. For LLM judge replay of call-shaped JSON fixtures, start the app with a configured Groq key and run `npm run eval:offline -- --rescore` (optionally pass a fixture path after the flag). Set `EVAL_BASE_URL` to target another deployment. The report is written to `eval/latest-report.json` (override with `EVAL_OUTPUT`). In `--rescore` mode, transcripts are sent to the configured Groq evaluation endpoint.
 
 ## Reliability and observability
 
 - Transient Groq failures (timeouts, rate limits, and server errors) use bounded exponential backoff with jitter. A process-local circuit breaker rejects calls during a short cooldown after repeated failures.
 - Tool execution has input/output schema checks, bounded results, safe fallback messages, and structured completion/error logs.
-- `/api/metrics` exposes rolling 15-minute request/error percentiles, token usage, client-reported time-to-first-token/audio, tool frequency/success, and circuit state. `/api/telemetry` accepts bounded latency samples.
+- `/api/metrics` exposes rolling 15-minute request/error percentiles, token usage, client-reported time-to-first-token/audio, tool frequency/success, and circuit state. The history view also surfaces turn errors and tool call volume. `/api/telemetry` accepts bounded latency samples.
 - Browser analytics are persisted per call. Server metrics are in-memory and per serverless instance; Vercel may scale or recycle instances, so these are operational diagnostics, not durable aggregate observability. Use a hosted metrics/logging backend for production operations.
 - `/api/health` indicates provider configuration. The local rate limiter is also process-local.
 

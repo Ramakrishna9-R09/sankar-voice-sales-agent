@@ -37,7 +37,7 @@
 .ops-panel-heading div{display:grid;gap:4px}
 .ops-panel-heading span{color:#939eae;font-size:7px;font-weight:700;letter-spacing:.7px}
 .ops-panel-heading strong{color:#344258;font:700 11px var(--display)}
-.ops-metrics{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:7px}
+.ops-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:7px}
 .ops-metric{min-width:0;padding:8px;border-radius:5px;background:#f8f9fb}
 .ops-metric span{display:block;color:#8995a6;font-size:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ops-metric strong{display:block;margin-top:5px;color:#344258;font:700 12px var(--display)}
