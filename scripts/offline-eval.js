@@ -9,8 +9,10 @@ import { CircuitBreaker, retryTransient } from '../agent/reliability.js';
 import { rankSemanticFacts } from '../public/memory.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const fixturePath = path.resolve(process.argv[2] && process.argv[2] !== '--rescore' ? process.argv[2] : path.join(root, 'eval', 'fixtures.json'));
-const rescore = process.argv.includes('--rescore');
+const cliArgs = process.argv.slice(2);
+const fixtureArg = cliArgs.find((argument) => argument !== '--rescore');
+const fixturePath = path.resolve(fixtureArg || path.join(root, 'eval', 'fixtures.json'));
+const rescore = cliArgs.includes('--rescore');
 const baseUrl = (process.env.EVAL_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
 const outputPath = process.env.EVAL_OUTPUT || path.join(root, 'eval', 'latest-report.json');
 const fixtures = JSON.parse(await readFile(fixturePath, 'utf8'));

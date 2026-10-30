@@ -66,10 +66,10 @@ Do not configure prices or claims without approval. Missing catalog facts cause 
 
 ### Optional calendar and CRM adapters
 
-The app accepts HTTPS JSON webhooks to avoid coupling the agent to one CRM/calendar vendor:
+The app accepts HTTPS JSON webhooks to avoid coupling the agent to one CRM/calendar vendor. Each event includes bounded call context (`call_id`, prospect, and product) plus the action fields:
 
-- `FOLLOWUP_WEBHOOK_URL` receives `{ requested_time, channel, notes }`. It is treated as booked only when the response is JSON containing `{ "booked": true }`; otherwise the assistant describes it as a captured request needing confirmation.
-- `CRM_WEBHOOK_URL` receives `{ status, reason }` when the agent updates the lead outcome.
+- `FOLLOWUP_WEBHOOK_URL` receives `{ call_id, prospect, product, requested_time, channel, notes }`. It is treated as booked only when the response is JSON containing `{ "booked": true }`; otherwise the assistant describes it as a captured request needing confirmation.
+- `CRM_WEBHOOK_URL` receives `{ call_id, prospect, product, status, reason }` when the agent updates the lead outcome.
 - `INTEGRATION_WEBHOOK_SECRET` is sent as a Bearer credential to either endpoint. Configure a receiver-side secret and use HTTPS.
 
 The receiver must be idempotent because network retries can repeat a webhook. These adapters do not claim to be a direct Google Calendar or CRM SDK integration; connect the endpoint to an approved workflow (for example a small server-side adapter or automation service) and verify its booking response contract.
@@ -107,11 +107,25 @@ The default command runs deterministic no-network checks for intent/stage decisi
 - Browser analytics are persisted per call. Server metrics are in-memory and per serverless instance; Vercel may scale or recycle instances, so these are operational diagnostics, not durable aggregate observability. Use a hosted metrics/logging backend for production operations.
 - `/api/health` indicates provider configuration. The local rate limiter is also process-local.
 
-## Human control and boundaries
+Query runtime metrics directly:
 
-An operator can take over, type a response for voice playback, and hand control back to the agent; operator turns remain visible in the transcript and are included in evaluation. Product claims are constrained to verified catalog results. Scheduling is never represented as booked unless the configured webhook returns explicit confirmation.
+```bash
+curl https://your-deployment.example/api/metrics
+```
 
-This project is a portfolio/demo architecture, not a multi-tenant production deployment. Browser history and memory have no authentication or cross-device sync. Before a real sales deployment, add authenticated users, durable encrypted storage, tenant-scoped data access, centralized metrics, retention controls, and provider-side consent/compliance review.
+The response groups provider counts/errors/tokens under `groq`, turn latency/errors under `turns`, client voice percentiles under `voice`, per-tool calls/success under `tools`, and breaker state under `circuit`. Client voice timings are submitted at call completion; the dashboard can refresh after the call.
+
+## Human-in-the-loop
+
+During an active call, the operator can take control, type a response for Groq TTS playback, and resume the AI when ready. The AI remains paused during operator control. Operator messages are tagged in the live and saved transcript, forwarded to the agent as human context when control resumes, counted as assistant speech in the talk/listen ratio, and labeled as human operator turns for evaluation.
+
+## Limitations
+
+- This is a portfolio/demo architecture, not a multi-tenant production deployment. Browser history, recordings, and prospect memory are not authenticated, encrypted for shared access, or synchronized across devices.
+- Server metrics and rate limits are process-local; Vercel may route requests to different instances or recycle them. Use centralized telemetry and a shared rate-limit store for durable production monitoring.
+- RMS VAD and Web Speech recognition depend on browser and microphone conditions. The current recognizer locale is `en-IN`; noisy environments may need hosted STT and neural VAD.
+- Calendar and CRM behavior depends on customer-configured webhooks. The project does not ship a Google Calendar, Calendly, or CRM SDK integration.
+- Call recording is browser-local and consent-gated. Production use still needs jurisdiction-specific consent, retention, deletion, and vendor policy review.
 
 ## Code map
 
@@ -122,7 +136,7 @@ This project is a portfolio/demo architecture, not a multi-tenant production dep
 - `agent/evaluation.js`: normalized structured judge output and transcript-derived measures.
 - `public/app.js`, `public/voice-activity.js`: call lifecycle, voice playback, VAD, operator mode, transcript/history/analytics.
 - `public/memory.js`: ranked semantic and episodic IndexedDB memory with migration and decay.
-- `eval/fixtures.json`, `scripts/offline-eval.js`: replay fixtures against the running evaluator.
+- `eval/fixtures.json`, `scripts/offline-eval.js`: deterministic no-network checks and optional Groq judge replay.
 - `api/[...path].js`: Vercel serverless adapter for Express.
 
 ## Deploy
