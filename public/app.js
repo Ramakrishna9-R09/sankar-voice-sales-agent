@@ -1,3 +1,5 @@
+import { clearProspectMemory, getProspectMemory, rememberProspect } from './memory.js';
+
 (() => {
   'use strict';
 
@@ -13,7 +15,10 @@
     startedAt: 0, timer: null, recognizer: null, stream: null, recorder: null,
     chunks: [], audioContext: null, audioDestination: null, audioElement: null,
     audioNode: null, messages: [], calls: [], prefs: { ...DEFAULTS },
-    toastTimer: null, audioUrl: null, currentAudio: null, filter: 'all', search: ''
+    toastTimer: null, audioUrl: null, currentAudio: null, filter: 'all', search: '',
+    stage: 'introduction', intent: 'neutral', memory: null, turnController: null, turnSequence: 0,
+    streamMessage: null, speechQueue: [], speechQueueActive: false, speechGeneration: 0, speechController: null,
+    interimText: '', vadTimer: null, autoEndCall: false, suggestedStatus: '', toolActions: []
   };
 
   const escapeHTML = (value = '') => String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -66,7 +71,7 @@
       const health = await api('/api/health', null, { method: 'GET' }); state.configured = health.configured;
       if (state.configured) {
         label.textContent = 'AI engine connected'; wrap.className = 'environment-label ready';
-        title.textContent = 'Ready for a real conversation'; description.textContent = `${health.chatModel} · Groq Orpheus voice`;
+        title.textContent = 'Ready for a real conversation'; description.textContent = `${health.chatModel} · Groq Orpheus voice · streaming agent`;
         card.classList.add('connected');
       } else {
         label.textContent = 'AI setup required'; wrap.className = 'environment-label error';
@@ -133,11 +138,27 @@
     $('#sales-status').innerHTML = '<span class="outcome-mark">—</span><div><strong>Awaiting conversation</strong><p>Your AI will recommend a sales status.</p></div>';
   }
 
+  function renderEvaluation(evaluation) {
+    if (!evaluation) return '';
+    const metrics = [
+      ['Discovery quality', evaluation.discovery_quality],
+      ['Objection handling', evaluation.objection_handling_quality],
+      ['Overall effectiveness', evaluation.overall_sales_effectiveness]
+    ];
+    const ratio = evaluation.talk_to_listen_ratio || {};
+    const improvement = (evaluation.suggested_improvements || []).slice(0, 3).map((item) => `<p class="evaluation-note">${escapeHTML(item)}</p>`).join('');
+    return `<div class="evaluation-block"><div class="evaluation-title"><span>CALL EVALUATION</span><span>${Math.round(Number(ratio.prospect_percent) || 0)}% prospect / ${Math.round(Number(ratio.assistant_percent) || 0)}% assistant</span></div>${metrics.map(([label, score]) => { const value = Math.max(0, Math.min(10, Number(score) || 0)); return `<div class="evaluation-score-row"><span>${label}</span><strong>${value}/10</strong><div class="evaluation-score-track"><i style="width:${value * 10}%"></i></div></div>`; }).join('')}${improvement}</div>`;
+  }
+
   function showSummary(summary) {
-    $('#summary-state').textContent = summary.model ? 'AI ANALYZED' : 'AI ANALYZED';
-    $('#summary-content').innerHTML = `<div class="summary-data"><div class="summary-line"><strong>CALL SUMMARY</strong>${escapeHTML(summary.summary || 'Summary not available.')}</div><div class="summary-line"><strong>CUSTOMER NEEDS</strong>${escapeHTML(summary.customer_needs || 'Not clearly established.')}</div><div class="summary-line"><strong>OBJECTIONS</strong>${escapeHTML(summary.objections || 'No clear objection raised.')}</div><div class="summary-line"><strong>NEXT STEPS</strong>${escapeHTML(summary.next_steps || 'Follow up with the prospect.')}</div></div>`;
-    const cls = summary.status === 'Interested' ? 'interested' : summary.status === 'Demo Requested' ? 'demo' : summary.status === 'Follow-up Required' ? 'followup' : summary.status === 'Not Interested' ? 'not-interested' : summary.status === 'No Response' ? 'no-response' : '';
-    $('#sales-status').innerHTML = `<span class="status-pill ${cls}">${escapeHTML(summary.status || 'Interested')}</span><p class="status-note">${escapeHTML(summary.next_steps || 'Follow up with the prospect.')}</p>`;
+    $('#summary-state').textContent = summary.evaluation ? 'EVALUATED' : 'AI ANALYZED';
+    const signals = (summary.buying_signals || []).length ? `<div class="summary-line"><strong>BUYING SIGNALS</strong>${escapeHTML(summary.buying_signals.join(' · '))}</div>` : '';
+    const actions = (summary.tool_actions || []).map((action) => action.name === 'schedule_followup' ? `Follow-up requested: ${action.requested_time || 'time not specified'}${action.booked ? ' · booked' : ' · needs manual confirmation'}` : action.name === 'generate_quote' || action.name === 'calculate_pricing' ? action.available ? `Verified quote: ${action.currency || ''} ${action.total} ${action.billing_period || ''}` : 'Pricing requires sales confirmation' : action.name === 'update_lead_status' ? `Lead status updated: ${action.status}` : '').filter(Boolean);
+    const actionLine = actions.length ? `<div class="summary-line"><strong>CAPTURED ACTIONS</strong>${escapeHTML(actions.join(' · '))}</div>` : '';
+    $('#summary-content').innerHTML = `<div class="summary-data"><div class="summary-line"><strong>CALL SUMMARY</strong>${escapeHTML(summary.summary || 'Summary not available.')}</div><div class="summary-line"><strong>CUSTOMER NEEDS</strong>${escapeHTML(summary.customer_needs || 'Not clearly established.')}</div><div class="summary-line"><strong>OBJECTIONS</strong>${escapeHTML(summary.objections || 'No clear objection raised.')}</div><div class="summary-line"><strong>NEXT STEPS</strong>${escapeHTML(summary.next_steps || 'Follow up with the prospect.')}</div>${signals}${actionLine}${renderEvaluation(summary.evaluation)}</div>`;
+    const status = summary.status || summary.lead_status || 'Interested';
+    const cls = status === 'Interested' ? 'interested' : status === 'Demo Requested' ? 'demo' : status === 'Follow-up Required' ? 'followup' : status === 'Not Interested' ? 'not-interested' : status === 'No Response' ? 'no-response' : '';
+    $('#sales-status').innerHTML = `<span class="status-pill ${cls}">${escapeHTML(status)}</span><p class="status-note">${escapeHTML(summary.next_steps || 'Follow up with the prospect.')}</p>`;
   }
 
   async function createAudioGraph(recordCall) {
@@ -160,65 +181,168 @@
     } else state.audioNode.connect(state.audioContext.destination);
   }
 
-  async function speak(text) {
-    if (!state.active) return;
-    setVoiceState('speaking'); $('#stage-caption').textContent = 'AI-generated voice response';
+  const stageNames = { introduction: 'INTRODUCTION', discovery: 'DISCOVERY', pitch: 'VALUE PITCH', objection_handling: 'OBJECTION HANDLING', closing: 'CLOSING', summary_generation: 'SUMMARY' };
+  function updateAgentStage(stage) {
+    state.stage = stage;
+    const chip = $('#agent-stage'); chip.textContent = stageNames[stage] || 'DISCOVERY'; chip.hidden = !state.active;
+  }
+  function updateIntent(intent) {
+    state.intent = intent;
+    const chip = $('#intent-label');
+    chip.textContent = ({ buying_signal: 'BUYING SIGNAL', objection: 'OBJECTION', question: 'QUESTION', neutral: 'NEUTRAL' })[intent] || 'NEUTRAL';
+    chip.hidden = !state.active;
+  }
+
+  async function speakSentence(text, generation) {
+    if (!state.active || generation !== state.speechGeneration || !state.audioElement) return;
+    setVoiceState('speaking'); $('#stage-caption').textContent = 'Streaming AI voice · speak any time to interrupt';
+    const controller = new AbortController(); state.speechController = controller;
     try {
-      const response = await api('/api/speech', { text }, { raw: true });
-      if (!state.active) return;
+      const response = await api('/api/speech', { text }, { raw: true, signal: controller.signal });
+      if (!state.active || generation !== state.speechGeneration) return;
       const blob = await response.blob();
       if (state.audioUrl) URL.revokeObjectURL(state.audioUrl);
       state.audioUrl = URL.createObjectURL(blob);
       state.audioElement.src = state.audioUrl;
+      const ended = new Promise((resolve) => { state.audioElement.onended = resolve; state.audioElement.onerror = resolve; });
       await state.audioElement.play();
-      await new Promise((resolve) => { state.audioElement.onended = resolve; state.audioElement.onerror = resolve; });
-      if (state.active) {
-        setVoiceState('listening'); $('#stage-caption').textContent = 'Listening for the prospect';
+      startRecognition(true);
+      await ended;
+    } catch (error) {
+      if (error.name !== 'AbortError' && state.active && generation === state.speechGeneration) {
+        showNotice(`Voice generation failed: ${error.message}. The transcript is still available; check Groq model access.`);
+        $('#stage-caption').textContent = 'Voice unavailable · listening for the prospect';
         startRecognition();
       }
-    } catch (error) {
-      if (!state.active) return;
-      setVoiceState('error', error.message); showNotice(`Voice generation failed: ${error.message}`);
-      $('#stage-caption').textContent = 'Voice generation failed';
-      toast('AI voice could not be generated. Check the Groq voice configuration.');
-    }
+    } finally { if (state.speechController === controller) state.speechController = null; }
   }
 
-  async function requestTurn() {
+  async function drainSpeechQueue() {
+    if (state.speechQueueActive) return;
+    state.speechQueueActive = true;
+    const generation = state.speechGeneration;
+    while (state.speechQueue.length && state.active && generation === state.speechGeneration) {
+      await speakSentence(state.speechQueue.shift(), generation);
+    }
+    state.speechQueueActive = false;
+    if (state.speechQueue.length && state.active) { queueMicrotask(drainSpeechQueue); return; }
+    if (state.active && generation === state.speechGeneration) {
+      setVoiceState(state.thinking ? 'thinking' : 'listening');
+      if (!state.thinking) { $('#stage-caption').textContent = 'Listening for the prospect'; startRecognition(); }
+      if (state.autoEndCall) { state.autoEndCall = false; await finishCall(); }
+    }
+  }
+  function enqueueSpeech(text) {
+    if (!text || !state.active) return;
+    state.speechQueue.push(text);
+    setVoiceState('speaking');
+    if (!state.speechQueueActive) void drainSpeechQueue();
+  }
+
+  function interruptAssistant() {
+    if (!state.speaking && !state.thinking) return;
+    state.speechGeneration += 1; state.speechQueue = []; state.autoEndCall = false;
+    state.turnController?.abort(); state.turnController = null; state.speechController?.abort(); state.speechController = null; state.thinking = false; state.speaking = false;
+    if (state.streamMessage) {
+      state.messages = state.messages.filter((message) => message !== state.streamMessage);
+      state.streamMessage = null; renderMessages();
+    }
+    if (state.audioElement) { state.audioElement.pause(); state.audioElement.removeAttribute('src'); }
+    if (state.audioUrl) { URL.revokeObjectURL(state.audioUrl); state.audioUrl = null; }
+    setVoiceState('listening'); $('#stage-caption').textContent = 'Assistant paused · listening to the prospect';
+  }
+
+  async function requestTurn(instruction = '') {
+    const turnId = ++state.turnSequence;
+    state.turnController?.abort(); state.turnController = new AbortController();
+    state.thinking = true; setVoiceState('thinking'); $('#stage-caption').textContent = 'Thinking through the prospect’s response';
     try {
-      const result = await api('/api/turn', {
-        prospect: state.prefs.prospect, product: state.prefs.product, goal: state.prefs.goal, language: state.prefs.language,
-        messages: state.messages.map((m) => ({ role: m.role, content: m.content }))
+      const response = await fetch('/api/turn/stream', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: state.turnController.signal,
+        body: JSON.stringify({ prospect: state.prefs.prospect, product: state.prefs.product, goal: state.prefs.goal, language: state.prefs.language, stage: state.stage, memory: state.memory, instruction, messages: state.messages.map(({ role, content, internal }) => ({ role, content, internal })) })
       });
-      if (!state.active) return;
-      addMessage('assistant', result.reply); await speak(result.reply);
+      if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(data.error || `Request failed (${response.status})`); }
+      const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
+      const processFrame = (frame) => {
+        const line = frame.split(/\r?\n/).find((part) => part.startsWith('data:'));
+        if (!line || turnId !== state.turnSequence) return;
+        let event; try { event = JSON.parse(line.slice(5).trim()); } catch { return; }
+        if (event.type === 'stage') updateAgentStage(event.stage);
+        else if (event.type === 'intent') updateIntent(event.intent);
+        else if (event.type === 'delta') {
+          if (!state.streamMessage) {
+            state.streamMessage = { role: 'assistant', content: '', time: new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date()) };
+            state.messages.push(state.streamMessage);
+          }
+          state.streamMessage.content += event.text;
+          renderMessages();
+        } else if (event.type === 'sentence') enqueueSpeech(event.text);
+        else if (event.type === 'tool') {
+          $('#stage-caption').textContent = ({ check_product_info: 'Checking verified product information', calculate_pricing: 'Checking verified pricing', generate_quote: 'Preparing a verified quote', schedule_followup: 'Capturing follow-up request', update_lead_status: 'Updating lead outcome', end_call: 'Wrapping up the call' })[event.name] || 'Working on the next step';
+          if (event.action) state.toolActions.push(event.action);
+        }
+        else if (event.type === 'lead_status') state.suggestedStatus = event.status;
+        else if (event.type === 'action' && event.action === 'end_call') { state.autoEndCall = true; try { state.recognizer?.stop(); } catch { /* stop best-effort */ } }
+        else if (event.type === 'error') throw new Error(event.error || 'AI request failed.');
+      };
+      while (true) {
+        const { value, done } = await reader.read();
+        buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+        const frames = buffer.split(/\r?\n\r?\n/); buffer = frames.pop() || '';
+        for (const frame of frames) processFrame(frame);
+        if (done) break;
+      }
+      if (buffer.trim()) processFrame(buffer);
+      if (turnId === state.turnSequence) { state.streamMessage = null; renderMessages(); }
     } catch (error) {
-      if (!state.active) return;
-      setVoiceState('error', error.message); showNotice(`AI response failed: ${error.message}`);
-      toast('The model did not respond. Review the server and API settings.');
-      startRecognition();
+      if (error.name !== 'AbortError' && turnId === state.turnSequence && state.active) {
+        if (!state.streamMessage) addMessage('assistant', 'I’m sorry, I’m having trouble connecting right now. Could you repeat that in a moment, or would you prefer a follow-up?');
+        showNotice(`AI response failed: ${error.message}`); toast('The AI response could not be completed. You can try speaking again.');
+      }
+    } finally {
+      if (turnId === state.turnSequence) {
+        state.thinking = false; state.turnController = null;
+        if (state.active && !state.speechQueueActive && !state.speechQueue.length) {
+          if (state.autoEndCall) { state.autoEndCall = false; void finishCall(); }
+          else { setVoiceState('listening'); $('#stage-caption').textContent = 'Listening for the prospect'; startRecognition(); }
+        }
+      }
     }
   }
 
-  function startRecognition() {
-    if (!state.active || state.speaking || state.thinking || !SpeechRecognition || state.recognizer) return;
+  function submitUtterance(text) {
+    const words = String(text || '').trim();
+    if (!words || !state.active || state.ending) return;
+    if (state.thinking && !state.speaking) return; // Ignore a late final STT event after the VAD silence timer submitted the same phrase.
+    clearTimeout(state.vadTimer); state.vadTimer = null; state.interimText = '';
+    if (state.speaking || state.thinking) interruptAssistant();
+    state.thinking = true;
+    try { state.recognizer?.stop(); } catch { /* already stopped */ }
+    state.recognizer = null; addMessage('user', words); updateIntent('neutral'); setVoiceState('thinking');
+    void requestTurn();
+  }
+
+  function startRecognition(duringAssistant = false) {
+    if (!state.active || (!duringAssistant && state.thinking) || !SpeechRecognition || state.recognizer) return;
     const recognizer = new SpeechRecognition(); state.recognizer = recognizer;
     recognizer.lang = 'en-IN'; recognizer.continuous = true; recognizer.interimResults = true; recognizer.maxAlternatives = 1;
-    recognizer.onstart = () => setVoiceState('listening');
+    recognizer.onstart = () => { if (!state.speaking) setVoiceState('listening'); };
     recognizer.onresult = (event) => {
       let interim = '';
       for (let i = event.resultIndex; i < event.results.length; i += 1) {
         const result = event.results[i];
         if (result.isFinal) {
           const words = result[0].transcript.trim();
-          if (words && state.active && !state.thinking) {
-            state.thinking = true; $('#stage-caption').textContent = 'Processing the prospect’s response';
-            try { recognizer.stop(); } catch { /* already stopped */ }
-            state.recognizer = null; addMessage('user', words); setVoiceState('thinking'); requestTurn(); return;
-          }
+          if (words && state.active) { submitUtterance(words); return; }
         } else interim += result[0].transcript;
       }
-      if (interim) { $('#stage-caption').textContent = `Hearing: “${interim.slice(0, 100)}”`; }
+      if (interim.trim()) {
+        state.interimText = interim.trim();
+        if (state.speaking || state.thinking) interruptAssistant();
+        $('#stage-caption').textContent = `Hearing: “${state.interimText.slice(0, 90)}”`;
+        clearTimeout(state.vadTimer);
+        state.vadTimer = setTimeout(() => { if (state.interimText && state.active) submitUtterance(state.interimText); }, 850);
+      }
     };
     recognizer.onerror = (event) => {
       if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
@@ -228,9 +352,9 @@
     };
     recognizer.onend = () => {
       if (state.recognizer === recognizer) state.recognizer = null;
-      if (state.active && !state.thinking && !state.speaking) setTimeout(startRecognition, 280);
+      if (state.active && !state.thinking) setTimeout(() => startRecognition(state.speaking), 280);
     };
-    try { recognizer.start(); } catch { state.recognizer = null; setTimeout(startRecognition, 500); }
+    try { recognizer.start(); } catch { state.recognizer = null; setTimeout(() => startRecognition(state.speaking), 500); }
   }
 
   function showNotice(text) { const el = $('#call-notice'); el.textContent = text; el.hidden = false; }
@@ -240,19 +364,23 @@
     if (!state.configured) { await checkService(); if (!state.configured) { openModal('settings-modal'); return; } }
     if (!SpeechRecognition) { showNotice('Live speech recognition is not available in this browser. Open the app in Chrome or Edge on localhost or HTTPS.'); return; }
     if (!navigator.mediaDevices?.getUserMedia) { showNotice('This browser cannot access a microphone. Use a secure localhost or HTTPS connection.'); return; }
-    state.messages = []; renderMessages(); resetInsights(); $('#call-timer').textContent = '00:00';
+    state.messages = []; state.stage = 'introduction'; state.intent = 'neutral'; state.memory = null; state.suggestedStatus = ''; state.toolActions = []; state.speechQueue = []; state.autoEndCall = false;
+    renderMessages(); resetInsights(); $('#call-timer').textContent = '00:00'; updateAgentStage(state.stage); updateIntent(state.intent);
     $('#start-call').disabled = true;
     try {
+      if (state.prefs.prospect) {
+        try { state.memory = await getProspectMemory(state.prefs.prospect); }
+        catch { state.memory = null; showNotice('Returning-prospect memory could not be loaded; this call will continue without it.'); }
+      }
       state.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
       setCallState(true);
+      updateAgentStage(state.stage); updateIntent(state.intent);
       if ($('#record-consent').checked) {
         if (!window.MediaRecorder) { showNotice('This browser does not support recording. The conversation can continue without recording.'); $('#record-consent').checked = false; }
         else await createAudioGraph(true);
       } else await createAudioGraph(false);
-      const request = 'Open the call with a brief natural greeting, introduce yourself as Sankar Group’s AI sales assistant, say you would like to understand the prospect\'s situation, and ask one friendly discovery question. Do not make up product facts.';
-      state.messages.push({ role: 'user', content: request, internal: true });
-      const result = await api('/api/turn', { prospect: state.prefs.prospect, product: state.prefs.product, goal: state.prefs.goal, language: state.prefs.language, messages: state.messages.map(({ role, content }) => ({ role, content })) });
-      state.messages = []; addMessage('assistant', result.reply); await speak(result.reply);
+      const returning = state.memory?.last_outcome ? `This is a returning prospect. Use the local memory discreetly; do not repeat old objections unless relevant. Previous outcome: ${state.memory.last_outcome}.` : '';
+      await requestTurn(`Open the call with a brief natural greeting, introduce yourself as Sankar Group’s AI sales assistant, say you would like to understand the prospect’s situation, and ask one friendly discovery question. Do not make up product facts. ${returning}`);
     } catch (error) {
       showNotice(error.message || 'The call could not be started. Check microphone permission and server configuration.');
       if (state.active || state.stream) await finishCall(true);
@@ -263,17 +391,23 @@
   async function buildSummary() {
     $('#summary-state').textContent = 'ANALYZING';
     try {
-      const summary = await api('/api/summarize', { product: state.prefs.product, prospect: state.prefs.prospect, messages: state.messages.map((m) => ({ role: m.role, content: m.content })) });
+      const summary = await api('/api/summarize', { product: state.prefs.product, prospect: state.prefs.prospect, messages: state.messages.map((m) => ({ role: m.role, content: m.content })), actions: state.toolActions });
       showSummary(summary); return summary;
     } catch (error) {
-      const summary = { summary: `AI summary could not be generated: ${error.message}`, customer_needs: 'Review the transcript', objections: 'Review the transcript', next_steps: 'Check the AI service and retry', status: state.messages.some((m) => m.role === 'user') ? 'Interested' : 'No Response' };
+      const summary = { summary: `AI summary could not be generated: ${error.message}`, customer_needs: 'Review the transcript', objections: 'Review the transcript', next_steps: 'Check the AI service and retry', status: state.messages.some((m) => m.role === 'user') ? 'Interested' : 'No Response', buying_signals: [], tool_actions: state.toolActions, evaluation: { discovery_quality: 0, objection_handling_quality: 0, overall_sales_effectiveness: 0, talk_to_listen_ratio: { prospect_percent: 0, assistant_percent: 0 }, suggested_improvements: ['Retry call analysis from the service after checking the connection.'] } };
       showSummary(summary); return summary;
     }
   }
 
   async function finishCall(silent = false) {
     if ((!state.active && !state.stream) || state.ending) return;
-    state.ending = true; setCallState(false); $('#state-label').textContent = 'SAVING'; $('#start-call').disabled = true; $('#end-call').disabled = true;
+    state.ending = true; state.turnSequence += 1; state.turnController?.abort(); state.turnController = null;
+    updateAgentStage('summary_generation');
+    clearTimeout(state.vadTimer); state.vadTimer = null; state.speechGeneration += 1; state.speechQueue = []; state.autoEndCall = false;
+    state.speechController?.abort(); state.speechController = null;
+    if (state.streamMessage) { state.messages = state.messages.filter((message) => message !== state.streamMessage); state.streamMessage = null; renderMessages(); }
+    setCallState(false); $('#state-label').textContent = 'SAVING'; $('#start-call').disabled = true; $('#end-call').disabled = true;
+    $('#agent-stage').hidden = true; $('#intent-label').hidden = true;
     try { state.recognizer?.stop(); } catch { /* no active recognizer */ }
     state.recognizer = null;
     if (state.audioElement) { state.audioElement.pause(); state.audioElement.removeAttribute('src'); }
@@ -289,10 +423,14 @@
     let audioSaved = false; const callId = id();
     if (blob?.size > 1200) { try { await putAudio(callId, blob); audioSaved = true; } catch { showNotice('The transcript was saved, but browser storage could not save the recording.'); } }
     const summary = await buildSummary();
+    if (state.suggestedStatus) summary.status = state.suggestedStatus;
+    showSummary(summary);
+    try { await rememberProspect(state.prefs.prospect, summary, summary.status); }
+    catch { showNotice('Call analysis was saved, but prospect memory could not be updated in this browser.'); }
     const call = {
       id: callId, date: Date.now(), duration: Math.floor((Date.now() - state.startedAt) / 1000),
       prospect: state.prefs.prospect || 'New prospect', product: state.prefs.product || 'Your product', goal: state.prefs.goal,
-      messages: cleanMessages, summary, status: summary.status, audio: audioSaved
+      messages: cleanMessages, summary, actions: state.toolActions, status: summary.status, audio: audioSaved
     };
     state.calls.unshift(call); saveCalls(); renderHistory(); renderRecent();
     state.ending = false; $('#start-call').disabled = false; $('#state-label').textContent = 'READY';
@@ -313,12 +451,26 @@
     const query = state.search.toLowerCase();
     const calls = state.calls.filter((call) => (state.filter === 'all' || call.status === state.filter) && (!query || `${call.prospect} ${call.product} ${call.status} ${call.summary?.summary || ''}`.toLowerCase().includes(query)));
     $('#history-count').textContent = calls.length;
+    renderAnalytics();
     const host = $('#history-cards');
     if (!calls.length) {
       host.innerHTML = state.calls.length ? '<div class="history-empty"><div class="history-empty-icon">⌕</div><strong>No matching conversations</strong><p>Try a different name, product or outcome.</p></div>' : '<div class="history-empty"><div class="history-empty-icon">▤</div><strong>No conversations yet</strong><p>Once you finish a call, its recording, transcript, summary and outcome will be saved here.</p></div>';
       return;
     }
     host.innerHTML = calls.map((call) => `<article class="history-row"><div class="history-person"><span class="history-avatar">${escapeHTML((call.prospect || 'P')[0].toUpperCase())}</span><div><strong>${escapeHTML(call.prospect)}</strong><span>${escapeHTML(dateLabel(call.date))} · ${secondsLabel(call.duration || 0)}</span></div></div><div class="history-col"><span>PRODUCT</span><strong>${escapeHTML(call.product)}</strong></div><div class="history-col"><span>SUMMARY</span><strong>${escapeHTML(call.summary?.next_steps || 'Open call summary')}</strong></div><div class="history-col"><span>OUTCOME</span><strong><span class="status-pill ${statusClass(call.status)}">${escapeHTML(call.status)}</span></strong></div><div class="history-actions">${call.audio ? `<button class="history-action" data-play-call="${escapeHTML(call.id)}" title="Play call recording" aria-label="Play recording">▶</button>` : ''}<button class="history-action" data-open-call="${escapeHTML(call.id)}" title="Open transcript and analysis" aria-label="Open call details">↗</button><button class="history-action" data-delete-call="${escapeHTML(call.id)}" title="Delete call" aria-label="Delete call">×</button></div></article>`).join('');
+  }
+
+  function renderAnalytics() {
+    const strip = $('#analytics-strip');
+    if (!state.calls.length) { strip.innerHTML = ''; return; }
+    const scored = state.calls.map((call) => call.summary?.evaluation).filter(Boolean);
+    const average = (field) => scored.length ? (scored.reduce((sum, item) => sum + (Number(item[field]) || 0), 0) / scored.length).toFixed(1) : '—';
+    const objections = state.calls.map((call) => String(call.summary?.objections || '').trim()).filter((item) => item && item !== 'No clear objection raised.');
+    const objectionCounts = new Map(); objections.forEach((item) => objectionCounts.set(item, (objectionCounts.get(item) || 0) + 1));
+    const common = [...objectionCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || 'No recurring objection yet';
+    const converted = state.calls.filter((call) => call.status === 'Converted').length;
+    const conversion = `${Math.round(converted / state.calls.length * 100)}%`;
+    strip.innerHTML = `<div class="analytics-item"><span>Average effectiveness</span><strong>${average('overall_sales_effectiveness')}${scored.length ? '/10' : ''}</strong><small>Across ${scored.length} evaluated call${scored.length === 1 ? '' : 's'}</small></div><div class="analytics-item"><span>Discovery quality</span><strong>${average('discovery_quality')}${scored.length ? '/10' : ''}</strong><small>Average evaluator score</small></div><div class="analytics-item"><span>Objection handling</span><strong>${average('objection_handling_quality')}${scored.length ? '/10' : ''}</strong><small>Average evaluator score</small></div><div class="analytics-item"><span>Conversion rate</span><strong>${conversion}</strong><small>${converted} converted of ${state.calls.length} calls</small></div><div class="analytics-item"><span>Common objection</span><strong title="${escapeHTML(common)}">${escapeHTML(common.length > 28 ? `${common.slice(0, 27)}…` : common)}</strong><small>${objections.length} objection record${objections.length === 1 ? '' : 's'}</small></div>`;
   }
 
   async function openCall(callId) {
@@ -379,7 +531,10 @@
     $('#recent-list').addEventListener('click', (event) => { const open = event.target.closest('[data-open-call]'); if (open) openCall(open.dataset.openCall); });
     $('#clear-history').addEventListener('click', async () => {
       for (const call of state.calls) await removeAudio(call.id);
-      state.calls = []; saveCalls(); renderHistory(); renderRecent(); toast('Call history and recordings cleared from this browser.');
+      let memoryCleared = true;
+      try { await clearProspectMemory(); } catch { memoryCleared = false; }
+      state.calls = []; saveCalls(); renderHistory(); renderRecent();
+      toast(memoryCleared ? 'Call history, recordings, and prospect memory cleared from this browser.' : 'Call history was cleared, but prospect memory could not be removed.');
     });
     $$('[data-close]').forEach((button) => button.addEventListener('click', () => closeModal(button.dataset.close)));
     $$('.modal-layer').forEach((layer) => layer.addEventListener('click', (event) => { if (event.target === layer) closeModal(layer.id); }));

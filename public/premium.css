@@ -1,4 +1,21 @@
 /* Sankar Voice visual system: crisp workspace surfaces, clearer type, luminous voice stage. */
+
+.agent-stage-chip,.intent-chip{display:inline-flex;align-items:center;margin-left:7px;padding:3px 6px;border:1px solid rgba(178,164,230,.3);border-radius:999px;background:rgba(137,114,205,.1);color:#bfb2ee;font-size:7px;font-weight:700;letter-spacing:.45px;vertical-align:middle}
+.intent-chip{border-color:rgba(112,185,157,.28);background:rgba(83,168,131,.1);color:#a6ddc3}
+.analytics-strip{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:9px;margin:0 0 14px}
+.analytics-item{min-height:65px;padding:12px 14px;border:1px solid #e6e9ef;border-radius:7px;background:#fff}
+.analytics-item span{display:block;color:#929cad;font-size:7px;font-weight:700;letter-spacing:.65px;text-transform:uppercase}
+.analytics-item strong{display:block;margin-top:7px;color:#253247;font:700 16px var(--display)}
+.analytics-item small{display:block;margin-top:3px;color:#8a96a7;font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.evaluation-block{margin-top:12px;padding-top:10px;border-top:1px solid #edf0f4}
+.evaluation-title{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;color:#8c98a9;font-size:7px;font-weight:700;letter-spacing:.65px}
+.evaluation-score-row{display:grid;grid-template-columns:1fr auto;gap:5px 10px;align-items:center;margin:6px 0;color:#68768a;font-size:8px}
+.evaluation-score-row strong{color:#4b5870;font-size:8px;font-variant-numeric:tabular-nums}
+.evaluation-score-track{grid-column:1/-1;height:3px;border-radius:3px;background:#eef0f4;overflow:hidden}
+.evaluation-score-track i{display:block;height:100%;border-radius:3px;background:linear-gradient(90deg,#8871d2,#56a88a)}
+.evaluation-note{margin:8px 0 0;color:#778497;font-size:8px;line-height:1.5}
+@media(max-width:1050px){.analytics-strip{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:760px){.analytics-strip{grid-template-columns:repeat(2,minmax(0,1fr))}}
 body {
   background: radial-gradient(ellipse at 74% 0%, rgba(225, 220, 247, .35), transparent 35%), #f4f5f8;
 }

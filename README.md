@@ -1,54 +1,65 @@
 # Sankar Voice Sales Agent
 
-A browser-based SaaS sales assistant built for the Sankar Group intern assignment. It supports model-backed voice conversations, live transcripts, explicit recording consent, post-call analysis, lead classification, and searchable call history.
+A browser-based SaaS voice sales agent with Groq-powered conversation and speech, live transcript streaming, consent-based recording, structured call evaluation, lead status, and local call history.
 
 **Live demo:** [sankar-voice-sales.vercel.app](https://sankar-voice-sales.vercel.app/)
 
 ## Run locally
 
-Requirements: Node.js 20 or newer, a Groq API key, and Chrome or Edge for the browser's live speech-recognition API.
+Requirements: Node.js 20+, a Groq API key, and Chrome or Edge for the browser speech-recognition API.
 
 ```powershell
 npm install
 Copy-Item .env.example .env
 ```
 
-Add your key to `.env`:
-
-```dotenv
-GROQ_API_KEY=your_key_here
-```
-
-Then run:
+Set `GROQ_API_KEY` in `.env`, then start the server:
 
 ```powershell
 npm run dev
 ```
 
-Open `http://localhost:3000`. The API key remains on the server and is never sent to the browser. The status in the top bar confirms whether the AI service is configured.
+Open `http://localhost:3000`. Keep the API key on the server and out of browser code and version control. The app settings panel reports whether the server has a configured key.
 
-## Conversation flow
+Optional product catalog: set `GROQ_PRODUCT_CATALOG` to JSON in the server environment. Product keys are names and values may contain verified `description`, `features`, `integrations`, `price`, `currency`, `billing_period`, and `plan` fields. Leave price out unless approved pricing is available. `check_product_info`, `calculate_pricing`, and `generate_quote` only use catalog facts; without a configured price the agent offers a human pricing follow-up.
 
-1. Set the prospect, product, and discovery goal in the call brief.
-2. Start the call and allow microphone access. The server requests a model-generated discovery introduction, then generates its voice.
-3. The browser transcribes the prospect's speech in real time. Each final speech turn is sent to the server and Groq; the AI response is transcribed into the live feed and played as generated voice.
-4. Recording starts only when the operator checks the consent confirmation before starting the call. When enabled, the saved audio mixes the microphone and AI voice in the browser. It is not uploaded to the AI provider.
-5. End the call to generate a model-backed summary of needs, objections, next steps, and one of the requested statuses. The transcript, summary, outcome, and recording are saved locally in this browser.
+Example format (use facts and approved prices for your product):
+
+```json
+{"Example SaaS":{"description":"Verified product description","features":["Verified feature"],"integrations":["Verified integration"],"price":29,"currency":"USD","billing_period":"per seat per month"}}
+```
+
+## Agent workflow
+
+The server tracks six conversation stages: introduction, discovery, pitch, objection handling, closing, and summary generation. Stage guidance shapes the system prompt. The agent detects intent on each turn and can request verified product details or pricing, capture a requested follow-up, update the lead outcome, and end a call. Follow-up capture is not a calendar booking; a calendar integration must be added before claiming that an appointment is scheduled.
+
+Groq chat completions stream over Server-Sent Events. The browser renders each text delta and queues complete sentences for Groq Orpheus TTS as they arrive. The microphone recognizer runs during playback to allow interruption. Interim speech is finalized after a short silence window, with browser noise suppression and echo cancellation enabled.
+
+## Memory, recording, and evaluation
+
+- Short-term memory is the current call transcript sent to the server for each turn.
+- Returning-prospect memory stores the prospect name, company when present, preferences, prior objections, last outcome, and last contact time in IndexedDB on this device. A bounded memory summary is included in Groq prompts on that prospect’s next call; there is no separate external memory database.
+- Recording begins only when the operator confirms the prospect has consented. Audio is mixed in the browser and remains in IndexedDB on this device; it is not uploaded to Groq.
+- When a call ends, one structured Groq analysis returns the needs, objections, next steps, buying signals, lead status, and evaluator scores. Talk-to-listen ratio is calculated from transcript word counts; discovery, objection handling, and overall effectiveness are LLM judge scores on a 0–10 scale.
+- The analytics strip calculates average evaluation scores, conversion rate, and the most frequently repeated objection from this browser’s saved call history.
+
+Call transcripts, recordings, and prospect memory are local to the browser. The Clear action removes local calls and prospect memory; clearing site data removes all of them. Different browsers or devices do not share call history or prospect memory.
 
 ## Architecture
 
-- `server.js`: same-origin Express API. Keeps the Groq API key server-side, calls the chat completions endpoint for every conversation turn and summary, and calls the speech endpoint for generated voice. Basic request limits are applied to API routes.
-- `public/index.html`, `public/styles.css`, `public/premium.css`, `public/app.js`: responsive sales workspace, browser microphone and speech recognition, mixed audio recording, transcript and history UI.
-- `api/[...path].js`: Vercel serverless entry point for the Express API.
-- `localStorage`: call metadata, transcript, preferences. `IndexedDB`: call recordings. Clearing the site's browser storage removes this data.
-- No scripted assistant response is used when the AI is unavailable. The app surfaces a clear setup or provider error.
+- `server.js`: Express routes for health, Groq-backed streaming turns, structured evaluation, and Groq speech. The Groq API key remains server-side.
+- `agent/stages.js`: intent classification and deterministic stage transitions.
+- `agent/prompt.js`: stage-specific sales conversation guidance and bounded memory injection.
+- `agent/tools.js`: Groq function schemas and server-side tool handlers with catalog validation.
+- `agent/evaluation.js`: structured post-call evaluation and transcript-derived talk/listen ratio.
+- `public/app.js`: browser call lifecycle, SSE rendering, sentence playback queue, interruption handling, consent-based recording, and analytics.
+- `public/memory.js`: IndexedDB-backed prospect memory.
+- `api/[...path].js`: Vercel serverless entry point for Express.
 
-## Publish
+## Deploy
 
-Deploy the Express project to Vercel using the Vercel CLI or by importing the repository. Frontend files are in `public/`; Vercel runs the Express app as a serverless function. Configure `GROQ_API_KEY` in Vercel's Production environment and redeploy. Keep `.env` out of version control. Browser microphone access and speech recognition require HTTPS (or localhost).
+Deploy to Vercel and configure `GROQ_API_KEY` in the Production environment. Add the optional product catalog only when verified product/pricing data is available. Redeploy after environment-variable changes. The browser microphone and Web Speech API require HTTPS or localhost; recognition availability and accuracy depend on browser and locale support.
 
-Live speech recognition is supplied by the browser and is tuned for English (India). Generated voice uses Groq Orpheus English. Browser support and recognition quality depend on the browser, microphone, network, and speech-recognition locale.
+## Submission walkthrough
 
-## Short walkthrough video script
-
-“This is Sankar Voice, an AI sales workspace built for live discovery calls. I’ll set a prospect, product, and call goal, then start a real model-backed voice conversation. The prospect’s speech appears in the transcript in real time, and the assistant answers aloud using generated voice. Recording is off until I confirm the prospect has agreed; when enabled, the recording mixes both sides and stays in this browser. At the end, the AI analyzes the conversation, captures the needs and objections, recommends the next step, and assigns a sales outcome. The transcript, analysis, outcome, and recording are available in searchable call history.”
+“This is Sankar Voice, an AI sales workspace for live discovery calls. The agent moves through introduction, discovery, value pitch, objection handling, and next steps, while the transcript streams live. It can look up verified product details and pricing when a catalog is configured. Recording starts only after I confirm consent. At the end, it saves the transcript and recording locally, evaluates the conversation, captures buying signals and follow-up actions, and updates the pipeline analytics.”
