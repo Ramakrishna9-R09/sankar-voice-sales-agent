@@ -1,0 +1,32 @@
+[
+  {
+    "id": "budget-objection-followup",
+    "expected_intent": "neutral",
+    "expected_stage": "pitch",
+    "product": "Example SaaS",
+    "prospect": "Sample prospect",
+    "messages": [
+      { "role": "assistant", "content": "What workflow are you hoping to improve?" },
+      { "role": "user", "content": "Our team is small and we need to save time on reporting." },
+      { "role": "assistant", "content": "What takes the most time today?" },
+      { "role": "user", "content": "Manual updates. I am interested, but we have no budget this month." },
+      { "role": "assistant", "content": "Understood. Would a short follow-up next month be useful?" },
+      { "role": "user", "content": "Yes, email me in the first week." }
+    ],
+    "actions": [{ "name": "schedule_followup", "requested_time": "First week of next month", "booked": false }],
+    "expected_status": "Follow-up Required"
+  },
+  {
+    "id": "clear-decline",
+    "expected_intent": "objection",
+    "expected_stage": "objection_handling",
+    "product": "Example SaaS",
+    "prospect": "Sample prospect",
+    "messages": [
+      { "role": "assistant", "content": "May I ask about your current process?" },
+      { "role": "user", "content": "No thanks. We are not interested and do not want a follow-up." }
+    ],
+    "actions": [],
+    "expected_status": "Not Interested"
+  }
+]

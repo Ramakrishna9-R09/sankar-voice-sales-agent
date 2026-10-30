@@ -18,17 +18,24 @@ export function classifyIntent(text = '') {
 }
 
 export function nextStage(current, messages, intent, toolNames = []) {
-  // Keep stage transitions deterministic; the model advises within a stage but cannot skip discovery arbitrarily.
+  // Deterministic transitions keep discovery evidence-driven while allowing a clear objection or buying signal to move the call immediately.
   const validCurrent = AGENT_STAGES.includes(current) ? current : 'introduction';
-  const userTurns = messages.filter((message) => message.role === 'user' && !message.internal).length;
+  const customerTurns = messages.filter((message) => message.role === 'user' && !message.internal);
+  const userTurns = customerTurns.length;
   if (toolNames.includes('end_call')) return 'summary_generation';
   if (intent === 'objection') return 'objection_handling';
   if (intent === 'buying_signal' || toolNames.includes('schedule_followup') || toolNames.includes('generate_quote')) return 'closing';
   if (userTurns === 0) return 'introduction';
-  if (validCurrent === 'objection_handling') return userTurns >= 4 ? 'closing' : 'discovery';
-  if (userTurns < 3) return 'discovery';
-  if (userTurns < 5) return 'pitch';
-  return 'closing';
+  if (validCurrent === 'introduction') return 'discovery';
+  if (validCurrent === 'objection_handling') return 'pitch';
+  if (validCurrent === 'closing') return 'closing';
+  if (validCurrent === 'pitch') return userTurns >= 5 ? 'closing' : 'pitch';
+  const discoveryEvidence = customerTurns.filter((message) => {
+    const text = String(message.content || '').toLowerCase();
+    const hasNeedContext = /\b(workflow|process|team|need|goal|challenge|problem|currently|today|time|cost|impact|priority|budget|using|use)\b/.test(text);
+    return hasNeedContext && text.trim().split(/\s+/).length >= 5;
+  }).length;
+  return discoveryEvidence >= 2 || userTurns >= 4 ? 'pitch' : 'discovery';
 }
 
 export function normalizeIntent(value) {

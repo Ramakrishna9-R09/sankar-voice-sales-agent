@@ -3,10 +3,14 @@ import express from 'express';
 import helmet from 'helmet';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
 import { buildAgentMessages } from './agent/prompt.js';
 import { classifyIntent, nextStage, normalizeIntent } from './agent/stages.js';
-import { agentTools, executeTool } from './agent/tools.js';
+import { agentTools } from './agent/tools.js';
+import { executeToolBatch } from './agent/tool-runtime.js';
 import { evaluationInstruction, normalizeEvaluation } from './agent/evaluation.js';
+import { CircuitBreaker, retryTransient } from './agent/reliability.js';
+import { logEvent, metricsSnapshot, observeClientEvent, observeRequest, observeTokenUsage } from './agent/observability.js';
 
 const app = express();
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -16,6 +20,7 @@ const apiBase = 'https://api.groq.com/openai/v1';
 const limits = new Map();
 const MODEL = () => process.env.GROQ_CHAT_MODEL || 'openai/gpt-oss-120b';
 const stages = ['introduction', 'discovery', 'pitch', 'objection_handling', 'closing', 'summary_generation'];
+const groqCircuit = new CircuitBreaker();
 
 app.disable('x-powered-by');
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false, crossOriginResourcePolicy: { policy: 'same-origin' } }));
@@ -34,29 +39,58 @@ app.use('/api/', (req, res, next) => {
 
 const configured = () => Boolean(process.env.GROQ_API_KEY?.trim());
 app.get('/api/health', (_req, res) => res.json({ configured: configured(), provider: 'Groq', chatModel: MODEL(), voice: 'Groq Orpheus · English', stages }));
+app.get('/api/metrics', (_req, res) => res.json(metricsSnapshot(groqCircuit)));
+app.post('/api/telemetry', (req, res) => {
+  const events = Array.isArray(req.body?.events) ? req.body.events.slice(0, 40) : [];
+  let accepted = 0;
+  for (const item of events) if (observeClientEvent(item?.name, Number(item?.value_ms))) accepted += 1;
+  res.json({ accepted });
+});
 
-async function groq(pathname, payload, { accept = 'application/json', signal } = {}) {
+async function groq(pathname, payload, { accept = 'application/json', signal, requestId = randomUUID() } = {}) {
   if (!configured()) {
     const err = new Error('AI is not configured. Add GROQ_API_KEY to .env and restart the server.');
     err.status = 503;
     throw err;
   }
-  const timeout = AbortSignal.timeout(40_000);
-  const combinedSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-  const response = await fetch(`${apiBase}${pathname}`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json', Accept: accept },
-    body: JSON.stringify(payload), signal: combinedSignal
-  });
-  if (!response.ok) {
-    const text = await response.text();
-    let details = text.slice(0, 320);
-    try { details = JSON.parse(text).error?.message || details; } catch { /* retain bounded provider message */ }
-    const err = new Error(`AI provider returned ${response.status}: ${details}`);
-    err.status = response.status >= 500 ? 502 : response.status;
-    throw err;
+  const kind = pathname === '/audio/speech' ? 'speech' : 'groq';
+  const startedAt = Date.now();
+  try {
+    const response = await retryTransient(async (attempt) => {
+      groqCircuit.assertAvailable();
+      const timeout = AbortSignal.timeout(40_000);
+      const combinedSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+      try {
+        const result = await fetch(`${apiBase}${pathname}`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json', Accept: accept },
+          body: JSON.stringify(payload), signal: combinedSignal
+        });
+        if (!result.ok) {
+          const text = await result.text();
+          let details = text.slice(0, 320);
+          try { details = JSON.parse(text).error?.message || details; } catch { /* retain bounded provider message */ }
+          const error = new Error(`AI provider returned ${result.status}: ${details}`);
+          error.status = result.status >= 500 ? 502 : result.status;
+          const retryAfter = Number(result.headers.get('retry-after'));
+          if (retryAfter) error.retryAfterMs = Math.min(3000, retryAfter * 1000);
+          if ([408, 425, 429, 500, 502, 503, 504].includes(result.status)) groqCircuit.failure();
+          logEvent('groq_http_error', { request_id: requestId, path: pathname, status: result.status, attempt });
+          throw error;
+        }
+        groqCircuit.success();
+        return result;
+      } catch (error) {
+        if (!error.status && error.name !== 'AbortError') groqCircuit.failure();
+        throw error;
+      }
+    }, { retries: 2, signal, onRetry: (attempt, error) => logEvent('groq_retry', { request_id: requestId, path: pathname, attempt, status: error.status || null }) });
+    observeRequest({ kind, ok: true, latencyMs: Date.now() - startedAt });
+    return response;
+  } catch (error) {
+    observeRequest({ kind, ok: false, latencyMs: Date.now() - startedAt });
+    throw error;
   }
-  return response;
 }
 
 function splitSentences(buffer, flush = false) {
@@ -95,6 +129,7 @@ async function consumeGroqStream(response, onText) {
   const textParts = [];
   const toolMap = new Map();
   let finishReason = null;
+  let usage = null;
   async function processFrame(frame) {
     const line = frame.split('\n').find((part) => part.startsWith('data:'));
     if (!line) return;
@@ -103,6 +138,7 @@ async function consumeGroqStream(response, onText) {
     let chunk;
     try { chunk = JSON.parse(value); } catch { return; }
     const delta = chunk.choices?.[0]?.delta || {};
+    if (chunk.usage) usage = chunk.usage;
     if (typeof delta.content === 'string' && delta.content) {
       textParts.push(delta.content);
       await onText(delta.content);
@@ -126,12 +162,14 @@ async function consumeGroqStream(response, onText) {
     if (done) break;
   }
   if (buffer.trim()) await processFrame(buffer);
-  return { text: textParts.join(''), toolCalls: [...toolMap.values()], finishReason };
+  return { text: textParts.join(''), toolCalls: [...toolMap.values()], finishReason, usage };
 }
 
 async function runAgentTurn(body, onEvent, signal) {
+  const requestId = randomUUID();
+  const turnStarted = Date.now();
   if (Array.isArray(body.messages) && body.messages.length > 80) { const err = new Error('This call has reached its 80-turn context limit. End the call to save its summary and start a fresh session.'); err.status = 400; throw err; }
-  const messages = Array.isArray(body.messages) ? body.messages.filter((message) => message && typeof message === 'object' && ['assistant', 'user'].includes(message.role)).slice(-80) : [];
+  const messages = Array.isArray(body.messages) ? body.messages.filter((message) => message && typeof message === 'object' && ['assistant', 'operator', 'user'].includes(message.role)).slice(-80) : [];
   const userMessage = [...messages].reverse().find((message) => message.role === 'user' && !message.internal)?.content || '';
   const intent = normalizeIntent(classifyIntent(userMessage));
   let stage = stages.includes(body.stage) ? body.stage : 'introduction';
@@ -144,8 +182,13 @@ async function runAgentTurn(body, onEvent, signal) {
   let shouldEnd = false;
   let leadStatus = null;
   const toolActions = [];
+  let firstTokenMs = null;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let toolCount = 0;
   const publishText = async (chunk) => {
     if (!chunk) return;
+    if (firstTokenMs === null) firstTokenMs = Date.now() - turnStarted;
     fullText += chunk;
     await onEvent({ type: 'delta', text: chunk });
     sentenceBuffer += chunk;
@@ -155,30 +198,39 @@ async function runAgentTurn(body, onEvent, signal) {
   };
 
   for (let round = 0; round < 4; round += 1) {
-    const payload = { model: MODEL(), messages: chatMessages, temperature: 0.35, max_completion_tokens: 220, stream: true, tools: agentTools, tool_choice: 'auto', parallel_tool_calls: false };
-    const response = await groq('/chat/completions', payload, { accept: 'text/event-stream', signal });
+    const allowTools = round < 3;
+    const payload = { model: MODEL(), messages: chatMessages, temperature: 0.35, max_completion_tokens: 220, stream: true, stream_options: { include_usage: true }, ...(allowTools ? { tools: agentTools, tool_choice: 'auto', parallel_tool_calls: true } : {}) };
+    let response;
+    try { response = await groq('/chat/completions', payload, { accept: 'text/event-stream', signal, requestId }); }
+    catch (error) {
+      if (error.status === 400 && /stream_options/i.test(error.message)) {
+        delete payload.stream_options;
+        response = await groq('/chat/completions', payload, { accept: 'text/event-stream', signal, requestId });
+      } else throw error;
+    }
     const completion = await consumeGroqStream(response, publishText);
+    inputTokens += Number(completion.usage?.prompt_tokens) || 0;
+    outputTokens += Number(completion.usage?.completion_tokens) || 0;
+    if (completion.usage) observeTokenUsage('groq', completion.usage.prompt_tokens, completion.usage.completion_tokens);
     if (!completion.toolCalls.length) break;
-    const toolCalls = completion.toolCalls.map((call, index) => ({ ...call, index }));
+    if (!allowTools) { logEvent('tool_loop_limit', { request_id: requestId, round }); break; }
+    const toolCalls = completion.toolCalls.slice(0, 8).map((call, index) => ({ ...call, id: call.id || `${requestId}-${round}-${index}`, index }));
     chatMessages.push({ role: 'assistant', content: completion.text || null, tool_calls: toolCalls });
-    for (const call of toolCalls) {
-      if (!call.function.name || call.function.arguments.length > 4000) {
-        chatMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ error: 'Invalid tool arguments.' }) });
-        continue;
-      }
-      let args;
-      try { args = JSON.parse(call.function.arguments || '{}'); } catch { args = {}; }
-      const result = await executeTool(call.function.name, args);
-      if (call.function.name === 'end_call' && result.end_call) shouldEnd = true;
-      if (call.function.name === 'update_lead_status' && result.updated) leadStatus = result.status;
+    const results = await executeToolBatch(toolCalls.map((call) => ({ id: call.id, name: call.function?.name, arguments: call.function?.arguments })), { requestId, signal, context: { call_id: requestId, prospect: String(body.prospect || '').slice(0, 100), product: String(body.product || '').slice(0, 120) } });
+    toolCount += results.length;
+    for (const result of results) {
+      const name = result.name;
+      const value = result.content;
+      if (name === 'end_call' && value.end_call) shouldEnd = true;
+      if (name === 'update_lead_status' && value.updated) leadStatus = value.status;
       let action = null;
-      if (call.function.name === 'schedule_followup') action = { name: call.function.name, requested_time: result.requested_time, channel: result.channel, booked: false };
-      else if (['calculate_pricing', 'generate_quote'].includes(call.function.name)) action = { name: call.function.name, available: result.available, product: result.product, quantity: result.quantity, total: result.total, currency: result.currency, billing_period: result.billing_period };
-      else if (call.function.name === 'update_lead_status' && result.updated) action = { name: call.function.name, status: result.status, reason: result.reason };
-      else if (call.function.name === 'end_call' && result.end_call) action = { name: call.function.name, reason: result.reason };
+      if (name === 'schedule_followup' && result.ok) action = { name, requested_time: value.requested_time, channel: value.channel, booked: value.booked === true };
+      else if (['calculate_pricing', 'generate_quote'].includes(name) && result.ok) action = { name, available: value.available, product: value.product, quantity: value.quantity, total: value.total, currency: value.currency, billing_period: value.billing_period };
+      else if (name === 'update_lead_status' && value.updated) action = { name, status: value.status, reason: value.reason, synced: value.synced === true };
+      else if (name === 'end_call' && value.end_call) action = { name, reason: value.reason };
       if (action) toolActions.push(action);
-      await onEvent({ type: 'tool', name: call.function.name, ok: !result.error, action });
-      chatMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result).slice(0, 3000) });
+      await onEvent({ type: 'tool', name, ok: result.ok, elapsed_ms: result.elapsedMs, action });
+      chatMessages.push({ role: 'tool', tool_call_id: result.id, content: JSON.stringify(value).slice(0, 3000) });
     }
   }
   const trailing = splitSentences(sentenceBuffer, true);
@@ -192,10 +244,16 @@ async function runAgentTurn(body, onEvent, signal) {
   await onEvent({ type: 'stage', stage: finalStage });
   if (leadStatus) await onEvent({ type: 'lead_status', status: leadStatus });
   if (shouldEnd) await onEvent({ type: 'action', action: 'end_call' });
-  return { reply: fullText.trim(), stage: finalStage, intent, leadStatus, shouldEnd, toolActions };
+  const latencyMs = Date.now() - turnStarted;
+  const metrics = { request_id: requestId, first_token_ms: firstTokenMs, total_latency_ms: latencyMs, input_tokens: inputTokens || null, output_tokens: outputTokens || null, tool_calls: toolCount };
+  observeRequest({ kind: 'turns', ok: true, latencyMs, inputTokens, outputTokens });
+  logEvent('turn_complete', { ...metrics, stage: finalStage, intent });
+  await onEvent({ type: 'turn_metrics', ...metrics });
+  return { reply: fullText.trim(), stage: finalStage, intent, leadStatus, shouldEnd, toolActions, metrics };
 }
 
 app.post('/api/turn/stream', async (req, res) => {
+  const requestStarted = Date.now();
   res.status(200).set({ 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
   res.flushHeaders?.();
   const controller = new AbortController();
@@ -206,6 +264,8 @@ app.post('/api/turn/stream', async (req, res) => {
     if (!res.writableEnded) res.end();
   } catch (error) {
     if (!controller.signal.aborted) {
+      observeRequest({ kind: 'turns', ok: false, latencyMs: Date.now() - requestStarted });
+      logEvent('turn_error', { error_name: error.name, status: error.status || 502, elapsed_ms: Date.now() - requestStarted });
       send({ type: 'error', error: error.name === 'TimeoutError' || error.name === 'AbortError' ? 'The AI took too long to respond. Please try again.' : error.message || 'The AI service is temporarily unavailable.' });
       res.end();
     }
@@ -213,20 +273,23 @@ app.post('/api/turn/stream', async (req, res) => {
 });
 
 app.post('/api/turn', async (req, res) => {
+  const requestStarted = Date.now();
   try {
     const events = [];
     const result = await runAgentTurn(req.body || {}, async (event) => events.push(event));
     res.json({ ...result, events });
   } catch (error) {
+    observeRequest({ kind: 'turns', ok: false, latencyMs: Date.now() - requestStarted });
+    logEvent('turn_error', { error_name: error.name, status: error.status || 502, elapsed_ms: Date.now() - requestStarted });
     res.status(error.status || 502).json({ error: error.name === 'TimeoutError' ? 'The AI response took too long. Please try again.' : error.message || 'The AI service is temporarily unavailable.' });
   }
 });
 
-app.post('/api/summarize', async (req, res) => {
+async function handleEvaluation(req, res) {
   try {
     const { product, prospect, messages = [], actions = [] } = req.body || {};
     if (!Array.isArray(messages) || messages.length > 80) return res.status(400).json({ error: 'Invalid transcript.' });
-    const transcript = messages.map((message) => `${message.role === 'assistant' ? 'Assistant' : 'Prospect'}: ${String(message.content || '').slice(0, 1600)}`).join('\n').slice(0, 22000);
+    const transcript = messages.map((message) => `${message.role === 'operator' ? 'Human operator' : message.role === 'assistant' ? 'AI assistant' : 'Prospect'}: ${String(message.content || '').slice(0, 1600)}`).join('\n').slice(0, 22000);
     const response = await groq('/chat/completions', {
       model: MODEL(), temperature: 0.1, max_completion_tokens: 900,
       response_format: { type: 'json_object' },
@@ -236,14 +299,18 @@ app.post('/api/summarize', async (req, res) => {
       ]
     });
     const data = await response.json();
+    observeTokenUsage('groq', data.usage?.prompt_tokens, data.usage?.completion_tokens);
     const parsed = JSON.parse(data.choices?.[0]?.message?.content || '{}');
     res.json({ ...normalizeEvaluation(parsed, messages), tool_actions: Array.isArray(actions) ? actions.slice(0, 20) : [], model: data.model || MODEL() });
   } catch (error) {
     res.status(error.status || 502).json({ error: error.name === 'TimeoutError' ? 'Call evaluation timed out. Please retry from call history.' : error.message || 'Could not analyze this call.' });
   }
-});
+}
+app.post('/api/summarize', handleEvaluation);
+app.post('/api/evaluate', handleEvaluation);
 
 app.post('/api/speech', async (req, res) => {
+  const startedAt = Date.now();
   try {
     const text = String(req.body?.text || '').trim().slice(0, 200);
     if (!text) return res.status(400).json({ error: 'Speech text is required.' });
@@ -253,8 +320,13 @@ app.post('/api/speech', async (req, res) => {
     }, { accept: 'audio/wav' });
     res.set('Content-Type', response.headers.get('content-type') || 'audio/wav');
     res.set('Cache-Control', 'no-store');
-    res.send(Buffer.from(await response.arrayBuffer()));
+    const audio = Buffer.from(await response.arrayBuffer());
+    observeRequest({ kind: 'speech', ok: true, latencyMs: Date.now() - startedAt });
+    logEvent('speech_complete', { elapsed_ms: Date.now() - startedAt, characters: text.length, audio_bytes: audio.length });
+    res.send(audio);
   } catch (error) {
+    observeRequest({ kind: 'speech', ok: false, latencyMs: Date.now() - startedAt });
+    logEvent('speech_error', { status: error.status || 502, error_name: error.name, elapsed_ms: Date.now() - startedAt });
     res.status(error.status || 502).json({ error: error.message || 'Voice generation failed.' });
   }
 });

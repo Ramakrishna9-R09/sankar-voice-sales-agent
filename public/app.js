@@ -1,4 +1,5 @@
 import { clearProspectMemory, getProspectMemory, rememberProspect } from './memory.js';
+import { EnergyVAD } from './voice-activity.js';
 
 (() => {
   'use strict';
@@ -13,12 +14,14 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
   const state = {
     configured: false, active: false, ending: false, thinking: false, speaking: false,
     startedAt: 0, timer: null, recognizer: null, stream: null, recorder: null,
-    chunks: [], audioContext: null, audioDestination: null, audioElement: null,
+    chunks: [], audioContext: null, audioDestination: null, audioElement: null, vad: null, vadActive: false,
     audioNode: null, messages: [], calls: [], prefs: { ...DEFAULTS },
     toastTimer: null, audioUrl: null, currentAudio: null, filter: 'all', search: '',
     stage: 'introduction', intent: 'neutral', memory: null, turnController: null, turnSequence: 0,
     streamMessage: null, speechQueue: [], speechQueueActive: false, speechGeneration: 0, speechController: null,
-    interimText: '', vadTimer: null, autoEndCall: false, suggestedStatus: '', toolActions: []
+    interimText: '', vadTimer: null, autoEndCall: false, suggestedStatus: '', toolActions: [],
+    humanControl: false, openedCallId: null, playbackCallId: null, activeTurnStats: null,
+    callMetrics: null, metricsRefreshTimer: null
   };
 
   const escapeHTML = (value = '') => String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -93,6 +96,9 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
     state.active = active;
     $('#start-call').disabled = active || state.ending;
     $('#end-call').disabled = !active || state.ending;
+    $('#takeover-call').disabled = !active || state.ending;
+    if (!active) { $('#takeover-call').hidden = false; $('#resume-ai').hidden = true; $('#operator-panel').hidden = true; }
+    else { $('#takeover-call').hidden = state.humanControl; $('#resume-ai').hidden = !state.humanControl; $('#operator-panel').hidden = !state.humanControl; }
     $('#session-state').classList.toggle('active', active);
     $('#state-label').textContent = state.ending ? 'SAVING' : active ? 'CALL IN PROGRESS' : 'READY';
     $('#transcript-live').hidden = !active;
@@ -111,19 +117,42 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
     $('#voice-substate').textContent = detail || (kind === 'speaking' ? 'A clear, natural response is on its way.' : kind === 'thinking' ? 'Finding a helpful, relevant answer.' : kind === 'listening' ? 'Go ahead — the assistant is listening.' : 'A calm, helpful conversation starts here.');
   }
 
+  function setVADActive(active, level = 0) {
+    state.vadActive = active;
+    const indicator = $('#vad-indicator');
+    indicator.hidden = !active;
+    indicator.style.setProperty('--vad-level', String(Math.max(0, Math.min(1, level))));
+    $('#assistant-stage').classList.toggle('vad-active', active);
+  }
+
   function renderMessages() {
     const feed = $('#conversation');
     if (!state.messages.length) {
       feed.innerHTML = '<div class="transcript-empty"><div class="empty-symbol">↳</div><strong>The conversation will show up here</strong><p>Start a call. You and your AI assistant will see every turn, as it happens.</p></div>';
       $('#transcript-copy').disabled = true; return;
     }
-    feed.innerHTML = state.messages.map((m) => `<article class="turn ${m.role === 'user' ? 'customer' : 'assistant'}"><div class="turn-avatar">${m.role === 'user' ? 'P' : 'S'}</div><div class="turn-body"><span class="turn-meta">${m.role === 'user' ? escapeHTML(state.prefs.prospect || 'Prospect') : 'Sankar AI'} · ${escapeHTML(m.time || '')}</span><div class="turn-bubble">${escapeHTML(m.content)}</div></div></article>`).join('');
+    feed.innerHTML = state.messages.map((m, index) => {
+      const operator = m.role === 'operator';
+      const who = m.role === 'user' ? escapeHTML(state.prefs.prospect || 'Prospect') : operator ? 'Human operator' : 'Sankar AI';
+      const timestamp = m.offset_ms != null && state.openedCallId && state.playbackCallId === state.openedCallId ? `<button class="turn-time-link" data-seek-call="${escapeHTML(state.openedCallId)}" data-seek-offset="${Number(m.offset_ms) / 1000}">${secondsLabel(Math.floor(Number(m.offset_ms) / 1000))}</button>` : '';
+      const active = state.playbackCallId && state.currentAudio && m.offset_ms != null && Math.abs(Number(m.offset_ms) / 1000 - state.currentAudio.currentTime) < 1.2 ? ' active-playback' : '';
+      return `<article class="turn ${m.role === 'user' ? 'customer' : operator ? 'operator' : 'assistant'}${active}" data-turn-index="${index}"><div class="turn-avatar">${m.role === 'user' ? 'P' : operator ? 'O' : 'S'}</div><div class="turn-body"><span class="turn-meta">${who} · ${escapeHTML(m.time || '')}${timestamp}</span><div class="turn-bubble">${escapeHTML(m.content)}</div></div></article>`;
+    }).join('');
     feed.scrollTop = feed.scrollHeight; $('#transcript-copy').disabled = false;
   }
 
   function addMessage(role, content) {
-    state.messages.push({ role, content, time: new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date()) });
+    state.messages.push({ role, content, time: new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date()), offset_ms: state.startedAt ? Date.now() - state.startedAt : null });
     renderMessages();
+  }
+
+  function freshCallMetrics() {
+    return { turns: 0, errors: 0, interruptions: 0, tool_calls: 0, input_tokens: 0, output_tokens: 0, time_to_first_token_ms: [], time_to_first_audio_ms: [], turn_total_ms: [], events: [] };
+  }
+  function trackCallMetric(name, value) {
+    if (!state.callMetrics || !Number.isFinite(value) || value < 0) return;
+    if (Array.isArray(state.callMetrics[name])) state.callMetrics[name].push(Math.round(value));
+    state.callMetrics.events.push({ name, value_ms: Math.round(value) });
   }
 
   function updateBrief() {
@@ -143,19 +172,24 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
     const metrics = [
       ['Discovery quality', evaluation.discovery_quality],
       ['Objection handling', evaluation.objection_handling_quality],
+      ['Need alignment', evaluation.need_alignment],
+      ['Factuality & compliance', evaluation.factuality_and_compliance],
+      ['Empathy & tone', evaluation.empathy_and_tone],
+      ['Next-step clarity', evaluation.next_step_clarity],
       ['Overall effectiveness', evaluation.overall_sales_effectiveness]
     ];
     const ratio = evaluation.talk_to_listen_ratio || {};
-    const improvement = (evaluation.suggested_improvements || []).slice(0, 3).map((item) => `<p class="evaluation-note">${escapeHTML(item)}</p>`).join('');
+    const improvement = [...(evaluation.strengths || []).map((item) => `Strength: ${item}`), ...(evaluation.suggested_improvements || [])].slice(0, 5).map((item) => `<p class="evaluation-note">${escapeHTML(item)}</p>`).join('');
     return `<div class="evaluation-block"><div class="evaluation-title"><span>CALL EVALUATION</span><span>${Math.round(Number(ratio.prospect_percent) || 0)}% prospect / ${Math.round(Number(ratio.assistant_percent) || 0)}% assistant</span></div>${metrics.map(([label, score]) => { const value = Math.max(0, Math.min(10, Number(score) || 0)); return `<div class="evaluation-score-row"><span>${label}</span><strong>${value}/10</strong><div class="evaluation-score-track"><i style="width:${value * 10}%"></i></div></div>`; }).join('')}${improvement}</div>`;
   }
 
   function showSummary(summary) {
     $('#summary-state').textContent = summary.evaluation ? 'EVALUATED' : 'AI ANALYZED';
     const signals = (summary.buying_signals || []).length ? `<div class="summary-line"><strong>BUYING SIGNALS</strong>${escapeHTML(summary.buying_signals.join(' · '))}</div>` : '';
+    const risks = (summary.risk_flags || []).length ? `<div class="summary-line"><strong>QUALITY FLAGS</strong>${escapeHTML(summary.risk_flags.join(' · '))}</div>` : '';
     const actions = (summary.tool_actions || []).map((action) => action.name === 'schedule_followup' ? `Follow-up requested: ${action.requested_time || 'time not specified'}${action.booked ? ' · booked' : ' · needs manual confirmation'}` : action.name === 'generate_quote' || action.name === 'calculate_pricing' ? action.available ? `Verified quote: ${action.currency || ''} ${action.total} ${action.billing_period || ''}` : 'Pricing requires sales confirmation' : action.name === 'update_lead_status' ? `Lead status updated: ${action.status}` : '').filter(Boolean);
     const actionLine = actions.length ? `<div class="summary-line"><strong>CAPTURED ACTIONS</strong>${escapeHTML(actions.join(' · '))}</div>` : '';
-    $('#summary-content').innerHTML = `<div class="summary-data"><div class="summary-line"><strong>CALL SUMMARY</strong>${escapeHTML(summary.summary || 'Summary not available.')}</div><div class="summary-line"><strong>CUSTOMER NEEDS</strong>${escapeHTML(summary.customer_needs || 'Not clearly established.')}</div><div class="summary-line"><strong>OBJECTIONS</strong>${escapeHTML(summary.objections || 'No clear objection raised.')}</div><div class="summary-line"><strong>NEXT STEPS</strong>${escapeHTML(summary.next_steps || 'Follow up with the prospect.')}</div>${signals}${actionLine}${renderEvaluation(summary.evaluation)}</div>`;
+    $('#summary-content').innerHTML = `<div class="summary-data"><div class="summary-line"><strong>CALL SUMMARY</strong>${escapeHTML(summary.summary || 'Summary not available.')}</div><div class="summary-line"><strong>CUSTOMER NEEDS</strong>${escapeHTML(summary.customer_needs || 'Not clearly established.')}</div><div class="summary-line"><strong>OBJECTIONS</strong>${escapeHTML(summary.objections || 'No clear objection raised.')}</div><div class="summary-line"><strong>NEXT STEPS</strong>${escapeHTML(summary.next_steps || 'Follow up with the prospect.')}</div>${signals}${risks}${actionLine}${renderEvaluation(summary.evaluation)}</div>`;
     const status = summary.status || summary.lead_status || 'Interested';
     const cls = status === 'Interested' ? 'interested' : status === 'Demo Requested' ? 'demo' : status === 'Follow-up Required' ? 'followup' : status === 'Not Interested' ? 'not-interested' : status === 'No Response' ? 'no-response' : '';
     $('#sales-status').innerHTML = `<span class="status-pill ${cls}">${escapeHTML(status)}</span><p class="status-note">${escapeHTML(summary.next_steps || 'Follow up with the prospect.')}</p>`;
@@ -179,6 +213,17 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
       state.recorder.ondataavailable = (event) => { if (event.data.size) state.chunks.push(event.data); };
       state.recorder.start(1000);
     } else state.audioNode.connect(state.audioContext.destination);
+    state.vad = new EnergyVAD({
+      onSpeechStart: () => {
+        setVADActive(true);
+        if (state.speaking) interruptAssistant();
+      },
+      onSpeechEnd: () => {
+        setVADActive(false);
+        if (state.interimText && state.active && !state.thinking) submitUtterance(state.interimText);
+      }
+    });
+    state.vad.start(state.audioContext, state.stream);
   }
 
   const stageNames = { introduction: 'INTRODUCTION', discovery: 'DISCOVERY', pitch: 'VALUE PITCH', objection_handling: 'OBJECTION HANDLING', closing: 'CLOSING', summary_generation: 'SUMMARY' };
@@ -193,7 +238,7 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
     chip.hidden = !state.active;
   }
 
-  async function speakSentence(text, generation) {
+  async function speakSentence(text, generation, turnStats) {
     if (!state.active || generation !== state.speechGeneration || !state.audioElement) return;
     setVoiceState('speaking'); $('#stage-caption').textContent = 'Streaming AI voice · speak any time to interrupt';
     const controller = new AbortController(); state.speechController = controller;
@@ -206,6 +251,10 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
       state.audioElement.src = state.audioUrl;
       const ended = new Promise((resolve) => { state.audioElement.onended = resolve; state.audioElement.onerror = resolve; });
       await state.audioElement.play();
+      if (turnStats && turnStats.firstAudioMs == null) {
+        turnStats.firstAudioMs = performance.now() - turnStats.startedAt;
+        trackCallMetric('time_to_first_audio_ms', turnStats.firstAudioMs);
+      }
       startRecognition(true);
       await ended;
     } catch (error) {
@@ -222,7 +271,8 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
     state.speechQueueActive = true;
     const generation = state.speechGeneration;
     while (state.speechQueue.length && state.active && generation === state.speechGeneration) {
-      await speakSentence(state.speechQueue.shift(), generation);
+      const item = state.speechQueue.shift();
+      await speakSentence(item.text, generation, item.turnStats);
     }
     state.speechQueueActive = false;
     if (state.speechQueue.length && state.active) { queueMicrotask(drainSpeechQueue); return; }
@@ -232,9 +282,9 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
       if (state.autoEndCall) { state.autoEndCall = false; await finishCall(); }
     }
   }
-  function enqueueSpeech(text) {
+  function enqueueSpeech(text, turnStats = state.activeTurnStats) {
     if (!text || !state.active) return;
-    state.speechQueue.push(text);
+    state.speechQueue.push({ text, turnStats });
     setVoiceState('speaking');
     if (!state.speechQueueActive) void drainSpeechQueue();
   }
@@ -254,6 +304,9 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
 
   async function requestTurn(instruction = '') {
     const turnId = ++state.turnSequence;
+    const turnStats = { startedAt: performance.now(), firstTokenMs: null, firstAudioMs: null, serverMetrics: null };
+    state.activeTurnStats = turnStats;
+    if (state.callMetrics) state.callMetrics.turns += 1;
     state.turnController?.abort(); state.turnController = new AbortController();
     state.thinking = true; setVoiceState('thinking'); $('#stage-caption').textContent = 'Thinking through the prospect’s response';
     try {
@@ -270,16 +323,25 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
         if (event.type === 'stage') updateAgentStage(event.stage);
         else if (event.type === 'intent') updateIntent(event.intent);
         else if (event.type === 'delta') {
+          if (turnStats.firstTokenMs == null) {
+            turnStats.firstTokenMs = performance.now() - turnStats.startedAt;
+            trackCallMetric('time_to_first_token_ms', turnStats.firstTokenMs);
+          }
           if (!state.streamMessage) {
-            state.streamMessage = { role: 'assistant', content: '', time: new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date()) };
+            state.streamMessage = { role: 'assistant', content: '', time: new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date()), offset_ms: state.startedAt ? Date.now() - state.startedAt : null };
             state.messages.push(state.streamMessage);
           }
           state.streamMessage.content += event.text;
           renderMessages();
-        } else if (event.type === 'sentence') enqueueSpeech(event.text);
+        } else if (event.type === 'sentence') enqueueSpeech(event.text, turnStats);
         else if (event.type === 'tool') {
           $('#stage-caption').textContent = ({ check_product_info: 'Checking verified product information', calculate_pricing: 'Checking verified pricing', generate_quote: 'Preparing a verified quote', schedule_followup: 'Capturing follow-up request', update_lead_status: 'Updating lead outcome', end_call: 'Wrapping up the call' })[event.name] || 'Working on the next step';
           if (event.action) state.toolActions.push(event.action);
+          if (state.callMetrics) state.callMetrics.tool_calls += 1;
+        }
+        else if (event.type === 'turn_metrics') {
+          turnStats.serverMetrics = event;
+          if (state.callMetrics) { state.callMetrics.input_tokens += Number(event.input_tokens) || 0; state.callMetrics.output_tokens += Number(event.output_tokens) || 0; }
         }
         else if (event.type === 'lead_status') state.suggestedStatus = event.status;
         else if (event.type === 'action' && event.action === 'end_call') { state.autoEndCall = true; try { state.recognizer?.stop(); } catch { /* stop best-effort */ } }
@@ -293,8 +355,11 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
         if (done) break;
       }
       if (buffer.trim()) processFrame(buffer);
+      trackCallMetric('turn_total_ms', performance.now() - turnStats.startedAt);
       if (turnId === state.turnSequence) { state.streamMessage = null; renderMessages(); }
     } catch (error) {
+      if (error.name !== 'AbortError' && state.callMetrics) state.callMetrics.errors += 1;
+      if (error.name === 'AbortError' && state.callMetrics) state.callMetrics.interruptions += 1;
       if (error.name !== 'AbortError' && turnId === state.turnSequence && state.active) {
         if (!state.streamMessage) addMessage('assistant', 'I’m sorry, I’m having trouble connecting right now. Could you repeat that in a moment, or would you prefer a follow-up?');
         showNotice(`AI response failed: ${error.message}`); toast('The AI response could not be completed. You can try speaking again.');
@@ -302,6 +367,7 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
     } finally {
       if (turnId === state.turnSequence) {
         state.thinking = false; state.turnController = null;
+        if (state.activeTurnStats === turnStats) state.activeTurnStats = null;
         if (state.active && !state.speechQueueActive && !state.speechQueue.length) {
           if (state.autoEndCall) { state.autoEndCall = false; void finishCall(); }
           else { setVoiceState('listening'); $('#stage-caption').textContent = 'Listening for the prospect'; startRecognition(); }
@@ -316,10 +382,39 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
     if (state.thinking && !state.speaking) return; // Ignore a late final STT event after the VAD silence timer submitted the same phrase.
     clearTimeout(state.vadTimer); state.vadTimer = null; state.interimText = '';
     if (state.speaking || state.thinking) interruptAssistant();
-    state.thinking = true;
     try { state.recognizer?.stop(); } catch { /* already stopped */ }
-    state.recognizer = null; addMessage('user', words); updateIntent('neutral'); setVoiceState('thinking');
+    state.recognizer = null; addMessage('user', words); updateIntent('neutral');
+    if (state.humanControl) { state.thinking = false; setVoiceState('listening', 'Human operator has control.'); startRecognition(); return; }
+    state.thinking = true; setVoiceState('thinking');
     void requestTurn();
+  }
+
+  function takeOverCall() {
+    if (!state.active || state.ending) return;
+    if (state.speaking || state.thinking) interruptAssistant();
+    state.humanControl = true;
+    $('#takeover-call').hidden = true; $('#resume-ai').hidden = false; $('#operator-panel').hidden = false;
+    setVoiceState('listening', 'Human operator has control.'); $('#stage-caption').textContent = 'Human operator in control';
+    startRecognition(); $('#operator-message').focus(); toast('AI paused. You can speak to the prospect or send a typed voice response.');
+  }
+
+  function resumeAI() {
+    if (!state.active || state.ending) return;
+    state.humanControl = false;
+    $('#takeover-call').hidden = false; $('#resume-ai').hidden = true; $('#operator-panel').hidden = true;
+    try { state.recognizer?.stop(); } catch { /* stop best-effort */ }
+    state.recognizer = null;
+    void requestTurn('A human operator has handed control back. Continue from the complete transcript, acknowledge the most recent operator response if relevant, and do not repeat the introduction.');
+  }
+
+  function sendOperatorMessage() {
+    const text = $('#operator-message').value.trim();
+    if (!text || !state.active || !state.humanControl) return;
+    $('#operator-message').value = '';
+    try { state.recognizer?.stop(); } catch { /* stop best-effort */ }
+    state.recognizer = null;
+    addMessage('operator', text);
+    enqueueSpeech(text, null);
   }
 
   function startRecognition(duringAssistant = false) {
@@ -364,12 +459,12 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
     if (!state.configured) { await checkService(); if (!state.configured) { openModal('settings-modal'); return; } }
     if (!SpeechRecognition) { showNotice('Live speech recognition is not available in this browser. Open the app in Chrome or Edge on localhost or HTTPS.'); return; }
     if (!navigator.mediaDevices?.getUserMedia) { showNotice('This browser cannot access a microphone. Use a secure localhost or HTTPS connection.'); return; }
-    state.messages = []; state.stage = 'introduction'; state.intent = 'neutral'; state.memory = null; state.suggestedStatus = ''; state.toolActions = []; state.speechQueue = []; state.autoEndCall = false;
+    state.messages = []; state.stage = 'introduction'; state.intent = 'neutral'; state.memory = null; state.suggestedStatus = ''; state.toolActions = []; state.speechQueue = []; state.autoEndCall = false; state.humanControl = false; state.callMetrics = freshCallMetrics(); state.openedCallId = null; state.playbackCallId = null;
     renderMessages(); resetInsights(); $('#call-timer').textContent = '00:00'; updateAgentStage(state.stage); updateIntent(state.intent);
     $('#start-call').disabled = true;
     try {
       if (state.prefs.prospect) {
-        try { state.memory = await getProspectMemory(state.prefs.prospect); }
+        try { state.memory = await getProspectMemory(state.prefs.prospect, `${state.prefs.product} ${state.prefs.goal}`); }
         catch { state.memory = null; showNotice('Returning-prospect memory could not be loaded; this call will continue without it.'); }
       }
       state.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
@@ -411,6 +506,7 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
     try { state.recognizer?.stop(); } catch { /* no active recognizer */ }
     state.recognizer = null;
     if (state.audioElement) { state.audioElement.pause(); state.audioElement.removeAttribute('src'); }
+    state.vad?.stop(); state.vad = null; setVADActive(false);
     if (state.stream) { state.stream.getTracks().forEach((track) => track.stop()); state.stream = null; }
     let blob = null;
     if (state.recorder && state.recorder.state !== 'inactive') {
@@ -425,12 +521,17 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
     const summary = await buildSummary();
     if (state.suggestedStatus) summary.status = state.suggestedStatus;
     showSummary(summary);
-    try { await rememberProspect(state.prefs.prospect, summary, summary.status); }
+    try { await rememberProspect(state.prefs.prospect, summary, summary.status, callId); }
     catch { showNotice('Call analysis was saved, but prospect memory could not be updated in this browser.'); }
+    if (state.callMetrics?.events?.length) {
+      try {
+        for (let i = 0; i < state.callMetrics.events.length; i += 40) await api('/api/telemetry', { events: state.callMetrics.events.slice(i, i + 40) });
+      } catch { /* telemetry is best-effort and must not delay local call saving */ }
+    }
     const call = {
       id: callId, date: Date.now(), duration: Math.floor((Date.now() - state.startedAt) / 1000),
       prospect: state.prefs.prospect || 'New prospect', product: state.prefs.product || 'Your product', goal: state.prefs.goal,
-      messages: cleanMessages, summary, actions: state.toolActions, status: summary.status, audio: audioSaved
+      messages: cleanMessages, summary, actions: state.toolActions, metrics: state.callMetrics, status: summary.status, audio: audioSaved
     };
     state.calls.unshift(call); saveCalls(); renderHistory(); renderRecent();
     state.ending = false; $('#start-call').disabled = false; $('#state-label').textContent = 'READY';
@@ -457,7 +558,7 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
       host.innerHTML = state.calls.length ? '<div class="history-empty"><div class="history-empty-icon">⌕</div><strong>No matching conversations</strong><p>Try a different name, product or outcome.</p></div>' : '<div class="history-empty"><div class="history-empty-icon">▤</div><strong>No conversations yet</strong><p>Once you finish a call, its recording, transcript, summary and outcome will be saved here.</p></div>';
       return;
     }
-    host.innerHTML = calls.map((call) => `<article class="history-row"><div class="history-person"><span class="history-avatar">${escapeHTML((call.prospect || 'P')[0].toUpperCase())}</span><div><strong>${escapeHTML(call.prospect)}</strong><span>${escapeHTML(dateLabel(call.date))} · ${secondsLabel(call.duration || 0)}</span></div></div><div class="history-col"><span>PRODUCT</span><strong>${escapeHTML(call.product)}</strong></div><div class="history-col"><span>SUMMARY</span><strong>${escapeHTML(call.summary?.next_steps || 'Open call summary')}</strong></div><div class="history-col"><span>OUTCOME</span><strong><span class="status-pill ${statusClass(call.status)}">${escapeHTML(call.status)}</span></strong></div><div class="history-actions">${call.audio ? `<button class="history-action" data-play-call="${escapeHTML(call.id)}" title="Play call recording" aria-label="Play recording">▶</button>` : ''}<button class="history-action" data-open-call="${escapeHTML(call.id)}" title="Open transcript and analysis" aria-label="Open call details">↗</button><button class="history-action" data-delete-call="${escapeHTML(call.id)}" title="Delete call" aria-label="Delete call">×</button></div></article>`).join('');
+    host.innerHTML = calls.map((call) => `<article class="history-row${state.playbackCallId === call.id ? ' active-playback' : ''}"><div class="history-person"><span class="history-avatar">${escapeHTML((call.prospect || 'P')[0].toUpperCase())}</span><div><strong>${escapeHTML(call.prospect)}</strong><span>${escapeHTML(dateLabel(call.date))} · ${secondsLabel(call.duration || 0)}</span></div></div><div class="history-col"><span>PRODUCT</span><strong>${escapeHTML(call.product)}</strong></div><div class="history-col"><span>SUMMARY</span><strong>${escapeHTML(call.summary?.next_steps || 'Open call summary')}</strong></div><div class="history-col"><span>OUTCOME</span><strong><span class="status-pill ${statusClass(call.status)}">${escapeHTML(call.status)}</span></strong></div><div class="history-actions">${call.audio ? `<button class="history-action" data-play-call="${escapeHTML(call.id)}" title="Play call recording" aria-label="Play recording">▶</button>` : ''}<button class="history-action" data-open-call="${escapeHTML(call.id)}" title="Open transcript and analysis" aria-label="Open call details">↗</button><button class="history-action" data-rescore-call="${escapeHTML(call.id)}" title="Re-score this call" aria-label="Re-score call">↻</button><button class="history-action" data-delete-call="${escapeHTML(call.id)}" title="Delete call" aria-label="Delete call">×</button></div></article>`).join('');
   }
 
   function renderAnalytics() {
@@ -470,11 +571,32 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
     const common = [...objectionCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || 'No recurring objection yet';
     const converted = state.calls.filter((call) => call.status === 'Converted').length;
     const conversion = `${Math.round(converted / state.calls.length * 100)}%`;
-    strip.innerHTML = `<div class="analytics-item"><span>Average effectiveness</span><strong>${average('overall_sales_effectiveness')}${scored.length ? '/10' : ''}</strong><small>Across ${scored.length} evaluated call${scored.length === 1 ? '' : 's'}</small></div><div class="analytics-item"><span>Discovery quality</span><strong>${average('discovery_quality')}${scored.length ? '/10' : ''}</strong><small>Average evaluator score</small></div><div class="analytics-item"><span>Objection handling</span><strong>${average('objection_handling_quality')}${scored.length ? '/10' : ''}</strong><small>Average evaluator score</small></div><div class="analytics-item"><span>Conversion rate</span><strong>${conversion}</strong><small>${converted} converted of ${state.calls.length} calls</small></div><div class="analytics-item"><span>Common objection</span><strong title="${escapeHTML(common)}">${escapeHTML(common.length > 28 ? `${common.slice(0, 27)}…` : common)}</strong><small>${objections.length} objection record${objections.length === 1 ? '' : 's'}</small></div>`;
+    const percentile50 = (values) => { const sorted = values.filter(Number.isFinite).sort((a, b) => a - b); return sorted.length ? `${Math.round(sorted[Math.floor((sorted.length - 1) * 0.5)])} ms` : '—'; };
+    const firstTokens = state.calls.flatMap((call) => call.metrics?.time_to_first_token_ms || []);
+    const firstAudio = state.calls.flatMap((call) => call.metrics?.time_to_first_audio_ms || []);
+    strip.innerHTML = `<div class="analytics-item"><span>Average effectiveness</span><strong>${average('overall_sales_effectiveness')}${scored.length ? '/10' : ''}</strong><small>Across ${scored.length} evaluated call${scored.length === 1 ? '' : 's'}</small></div><div class="analytics-item"><span>Discovery quality</span><strong>${average('discovery_quality')}${scored.length ? '/10' : ''}</strong><small>Average evaluator score</small></div><div class="analytics-item"><span>Objection handling</span><strong>${average('objection_handling_quality')}${scored.length ? '/10' : ''}</strong><small>Average evaluator score</small></div><div class="analytics-item"><span>Conversion rate</span><strong>${conversion}</strong><small>${converted} converted of ${state.calls.length} calls</small></div><div class="analytics-item"><span>Median first token</span><strong>${percentile50(firstTokens)}</strong><small>Saved call measurements</small></div><div class="analytics-item"><span>Median first audio</span><strong>${percentile50(firstAudio)}</strong><small>Saved call measurements</small></div><div class="analytics-item"><span>Common objection</span><strong title="${escapeHTML(common)}">${escapeHTML(common.length > 28 ? `${common.slice(0, 27)}…` : common)}</strong><small>${objections.length} objection record${objections.length === 1 ? '' : 's'}</small></div>`;
+  }
+
+  async function refreshMetrics() {
+    const host = $('#ops-metrics');
+    try {
+      const metrics = await api('/api/metrics', null, { method: 'GET' });
+      const fmt = (value) => value == null ? '—' : `${Math.round(value)} ms`;
+      const tools = Object.values(metrics.tools || {});
+      const toolCalls = tools.reduce((sum, item) => sum + item.calls, 0);
+      const toolErrors = tools.reduce((sum, item) => sum + item.errors, 0);
+      const toolSuccess = toolCalls ? `${Math.round((toolCalls - toolErrors) / toolCalls * 100)}%` : '—';
+      host.innerHTML = `<div class="ops-metric"><span>Time to first token · p50</span><strong>${fmt(metrics.voice?.time_to_first_token_ms?.p50_ms)}</strong></div><div class="ops-metric"><span>Time to first audio · p50</span><strong>${fmt(metrics.voice?.time_to_first_audio_ms?.p50_ms)}</strong></div><div class="ops-metric"><span>Turn latency · p95</span><strong>${fmt(metrics.turns?.p95_ms)}</strong></div><div class="ops-metric"><span>Groq request errors</span><strong>${Math.round((metrics.groq?.error_rate || 0) * 100)}%</strong></div><div class="ops-metric"><span>Tool success rate</span><strong>${toolSuccess}</strong></div><div class="ops-metric"><span>Tokens · input / output</span><strong>${Number(metrics.groq?.input_tokens || 0).toLocaleString()} / ${Number(metrics.groq?.output_tokens || 0).toLocaleString()}</strong></div>`;
+      $('#metrics-scope').textContent = `${metrics.scope || 'Instance-local'} · circuit ${metrics.circuit?.state || 'unknown'} · window resets after 15 minutes.`;
+    } catch {
+      host.innerHTML = '<div class="ops-metric"><span>Runtime telemetry</span><strong>Unavailable</strong></div>';
+      $('#metrics-scope').textContent = 'Metrics endpoint is unavailable. Call handling is unaffected.';
+    }
   }
 
   async function openCall(callId) {
     const call = state.calls.find((item) => item.id === callId); if (!call) return;
+    state.openedCallId = call.id;
     state.messages = call.messages || []; state.prefs = { ...state.prefs, prospect: call.prospect, product: call.product, goal: call.goal || DEFAULTS.goal };
     updateBrief(); renderMessages(); showSummary(call.summary || { status: call.status, summary: 'No analysis saved.', next_steps: 'Review the transcript.' });
     document.querySelector('#workspace').scrollIntoView({ behavior: 'smooth' }); toast('Saved transcript and AI analysis loaded.');
@@ -484,12 +606,59 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
     const active = state.calls.find((call) => call.id === callId); if (!active) return;
     try {
       const blob = await getAudio(callId); if (!blob) throw new Error('Recording is missing from this browser.');
-      if (state.currentAudio) { state.currentAudio.pause(); state.currentAudio = null; }
-      const url = URL.createObjectURL(blob); const audio = new Audio(url); state.currentAudio = audio;
-      button.textContent = 'Ⅱ'; audio.onended = () => { button.textContent = '▶'; URL.revokeObjectURL(url); state.currentAudio = null; };
+      if (state.currentAudio) { state.currentAudio.pause(); if (state.playbackUrl) URL.revokeObjectURL(state.playbackUrl); }
+      if (state.playbackButton) state.playbackButton.textContent = '▶';
+      await openCall(callId);
+      state.playbackCallId = callId;
+      renderMessages(); renderHistory();
+      const url = URL.createObjectURL(blob); const audio = new Audio(url); state.currentAudio = audio; state.playbackUrl = url; state.playbackButton = button;
+      button.textContent = 'Ⅱ'; let lastPaint = -1;
+      audio.ontimeupdate = () => { const second = Math.floor(audio.currentTime); if (second !== lastPaint) { lastPaint = second; renderMessages(); } };
+      audio.onended = () => { button.textContent = '▶'; renderMessages(); };
       audio.onerror = () => { button.textContent = '▶'; toast('This recording could not be played.'); };
       await audio.play();
     } catch (error) { toast(error.message || 'This recording could not be played.'); }
+  }
+
+  async function seekRecording(callId, offset) {
+    if (state.playbackCallId !== callId || !state.currentAudio) {
+      const row = document.querySelector(`[data-play-call="${CSS.escape(callId)}"]`);
+      if (row) await playCall(callId, row);
+    }
+    if (state.currentAudio && state.playbackCallId === callId) {
+      state.currentAudio.currentTime = Math.max(0, Number(offset) || 0);
+      try { await state.currentAudio.play(); } catch { /* browser may require another user gesture */ }
+      renderMessages();
+    }
+  }
+
+  async function rescoreCall(callId, button) {
+    const call = state.calls.find((item) => item.id === callId); if (!call) return;
+    button.disabled = true; button.textContent = '…';
+    try {
+      const summary = await api('/api/evaluate', { product: call.product, prospect: call.prospect, messages: call.messages || [], actions: call.actions || [] });
+      call.summary = summary; call.status = summary.status; saveCalls(); renderHistory(); renderRecent();
+      if (state.openedCallId === call.id) showSummary(summary);
+      toast('Saved call re-evaluated with the current rubric.');
+    } catch (error) { toast(`Re-score failed: ${error.message}`); }
+    finally { button.disabled = false; button.textContent = '↻'; }
+  }
+
+  function exportCallsCSV() {
+    const header = ['date', 'prospect', 'product', 'duration_seconds', 'status', 'summary', 'needs', 'objections', 'next_steps', 'discovery_score', 'objection_score', 'overall_score', 'transcript'];
+    const cells = state.calls.map((call) => {
+      const evaluation = call.summary?.evaluation || {};
+      const transcript = (call.messages || []).map((message) => `${message.role === 'user' ? call.prospect : message.role === 'operator' ? 'Human operator' : 'Sankar AI'}: ${message.content}`).join(' | ');
+      return [new Date(call.date).toISOString(), call.prospect, call.product, call.duration || 0, call.status, call.summary?.summary, call.summary?.customer_needs, call.summary?.objections, call.summary?.next_steps, evaluation.discovery_quality, evaluation.objection_handling_quality, evaluation.overall_sales_effectiveness, transcript];
+    });
+    const encode = (value) => {
+      let text = String(value ?? '').replace(/[\r\n]+/g, ' ');
+      if (/^[=+\-@]/.test(text)) text = `'${text}`;
+      return `"${text.replace(/"/g, '""')}"`;
+    };
+    const csv = [header, ...cells].map((row) => row.map(encode).join(',')).join('\r\n');
+    const url = URL.createObjectURL(new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8' }));
+    const link = document.createElement('a'); link.href = url; link.download = `sankar-voice-calls-${new Date().toISOString().slice(0, 10)}.csv`; link.click(); URL.revokeObjectURL(url);
   }
 
   function openModal(modalId) {
@@ -518,16 +687,24 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
     $('#settings-open').addEventListener('click', () => openModal('settings-modal'));
     $('#setup-link').addEventListener('click', () => openModal('settings-modal'));
     $('#transcript-copy').addEventListener('click', async () => {
-      try { await navigator.clipboard.writeText(state.messages.filter((m) => !m.internal).map((m) => `${m.role === 'user' ? state.prefs.prospect || 'Prospect' : 'Sankar AI'}: ${m.content}`).join('\n')); toast('Transcript copied.'); }
+      try { await navigator.clipboard.writeText(state.messages.filter((m) => !m.internal).map((m) => `${m.role === 'user' ? state.prefs.prospect || 'Prospect' : m.role === 'operator' ? 'Human operator' : 'Sankar AI'}: ${m.content}`).join('\n')); toast('Transcript copied.'); }
       catch { toast('Clipboard access is unavailable in this browser.'); }
     });
+    $('#takeover-call').addEventListener('click', takeOverCall);
+    $('#resume-ai').addEventListener('click', resumeAI);
+    $('#operator-send').addEventListener('click', sendOperatorMessage);
+    $('#operator-message').addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendOperatorMessage(); } });
+    $('#export-csv').addEventListener('click', exportCallsCSV);
+    $('#refresh-metrics').addEventListener('click', refreshMetrics);
     $('#history-search').addEventListener('input', (event) => { state.search = event.target.value; renderHistory(); });
     $('#history-filter').addEventListener('change', (event) => { state.filter = event.target.value; renderHistory(); });
     $('#history-cards').addEventListener('click', (event) => {
       const play = event.target.closest('[data-play-call]'); if (play) return playCall(play.dataset.playCall, play);
-      const remove = event.target.closest('[data-delete-call]'); if (remove) { const callId = remove.dataset.deleteCall; state.calls = state.calls.filter((call) => call.id !== callId); removeAudio(callId); saveCalls(); renderHistory(); renderRecent(); toast('Conversation removed from this browser.'); return; }
+      const rescore = event.target.closest('[data-rescore-call]'); if (rescore) return rescoreCall(rescore.dataset.rescoreCall, rescore);
+      const remove = event.target.closest('[data-delete-call]'); if (remove) { const callId = remove.dataset.deleteCall; if (state.playbackCallId === callId && state.currentAudio) { state.currentAudio.pause(); state.currentAudio = null; state.playbackCallId = null; } state.calls = state.calls.filter((call) => call.id !== callId); removeAudio(callId); saveCalls(); renderHistory(); renderRecent(); toast('Conversation removed from this browser.'); return; }
       const open = event.target.closest('[data-open-call]'); if (open) openCall(open.dataset.openCall);
     });
+    $('#conversation').addEventListener('click', (event) => { const seek = event.target.closest('[data-seek-call]'); if (seek) seekRecording(seek.dataset.seekCall, seek.dataset.seekOffset); });
     $('#recent-list').addEventListener('click', (event) => { const open = event.target.closest('[data-open-call]'); if (open) openCall(open.dataset.openCall); });
     $('#clear-history').addEventListener('click', async () => {
       for (const call of state.calls) await removeAudio(call.id);
@@ -539,7 +716,8 @@ import { clearProspectMemory, getProspectMemory, rememberProspect } from './memo
     $$('[data-close]').forEach((button) => button.addEventListener('click', () => closeModal(button.dataset.close)));
     $$('.modal-layer').forEach((layer) => layer.addEventListener('click', (event) => { if (event.target === layer) closeModal(layer.id); }));
     document.addEventListener('keydown', (event) => { if (event.key === 'Escape') $$('.modal-layer').forEach((layer) => { layer.hidden = true; }); });
-    window.addEventListener('beforeunload', () => { try { state.recognizer?.stop(); state.stream?.getTracks().forEach((track) => track.stop()); } catch { /* best effort */ } });
+    window.addEventListener('beforeunload', () => { try { state.recognizer?.stop(); state.vad?.stop(); state.stream?.getTracks().forEach((track) => track.stop()); } catch { /* best effort */ } });
+    await refreshMetrics();
   }
 
   init();
