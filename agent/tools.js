@@ -1,3 +1,5 @@
+import { retrieveKnowledge } from './knowledge.js';
+
 const leadStatuses = ['Converted', 'Interested', 'Follow-up Required', 'Not Interested', 'Demo Requested', 'No Response'];
 
 export const agentTools = [
@@ -36,6 +38,22 @@ export const agentTools = [
   {
     type: 'function',
     function: {
+      name: 'check_order_status',
+      description: 'Look up a customer order through the configured trusted order-status adapter. Never infer delivery status.',
+      parameters: { type: 'object', properties: { order_id: { type: 'string' } }, required: ['order_id'], additionalProperties: false }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'create_support_ticket',
+      description: 'Create a support ticket only when the customer explicitly asks for support or agrees to it. A ticket is confirmed only when the connected adapter confirms creation.',
+      parameters: { type: 'object', properties: { subject: { type: 'string' }, description: { type: 'string' }, priority: { type: 'string', enum: ['low', 'normal', 'high'] } }, required: ['subject', 'description'], additionalProperties: false }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'update_lead_status',
       description: 'Set the call outcome based only on evidence from the conversation.',
       parameters: { type: 'object', properties: { status: { type: 'string', enum: leadStatuses }, reason: { type: 'string' } }, required: ['status', 'reason'], additionalProperties: false }
@@ -52,7 +70,7 @@ export const agentTools = [
 ];
 
 function catalog() {
-  try { return JSON.parse(process.env.GROQ_PRODUCT_CATALOG || '{}'); }
+  try { return JSON.parse(process.env.PRODUCT_CATALOG_JSON || process.env.GROQ_PRODUCT_CATALOG || '{}'); }
   catch { return {}; }
 }
 
@@ -88,9 +106,10 @@ async function postIntegration(urlValue, payload, idempotencyKey) {
 export async function executeTool(name, args = {}, { idempotencyKey, context = {} } = {}) {
   switch (name) {
     case 'check_product_info': {
-      const product = findProduct(args.product);
-      if (!product) return { found: false, message: 'No verified product catalog entry is configured. Do not guess product capabilities; ask a discovery question or offer a sales follow-up.' };
-      return { found: true, product: product.name, description: product.description || '', features: Array.isArray(product.features) ? product.features : [], integrations: Array.isArray(product.integrations) ? product.integrations : [], message: product.description || 'Only the listed features are verified.' };
+      const results = retrieveKnowledge(args.question, args.product, { limit: 4 });
+      return results.length
+        ? { found: true, product: results[0].product, sources: results.map(({ kind, text, source }) => ({ kind, text, source })), message: results.map((item) => item.text).join(' ') }
+        : { found: false, product: args.product, sources: [], message: 'No matching verified product documentation is configured. Do not guess product capabilities; offer a sales follow-up.' };
     }
     case 'calculate_pricing':
     case 'generate_quote': {
@@ -108,6 +127,27 @@ export async function executeTool(name, args = {}, { idempotencyKey, context = {
         const booked = integration.configured && integration.data?.booked === true;
         return { captured: true, ...followup, booked, confirmation: booked ? String(integration.data.confirmation || '').slice(0, 180) : '', message: booked ? 'The connected scheduling service confirmed the follow-up.' : 'The prospect requested this follow-up. It has been captured, but no connected service confirmed a booking. Do not claim it is scheduled.' };
       }
+    case 'check_order_status': {
+      const url = process.env.ORDER_STATUS_WEBHOOK_URL;
+      if (!url) return { found: false, message: 'Order-status lookup is not connected. Do not infer status; offer a human follow-up.' };
+      const integration = await postIntegration(url, { ...context, order_id: args.order_id }, `order:${args.order_id}`);
+      const data = integration.data || {};
+      const status = String(data.status || '').slice(0, 40);
+      const expectedDelivery = String(data.expected_delivery || '').slice(0, 40);
+      const trackingUrl = safeHttpsUrl(data.tracking_url);
+      if (!integration.configured || !status) return { found: false, message: 'The connected order system did not return a verified status.' };
+      return { found: true, order_id: args.order_id, status, expected_delivery: expectedDelivery, tracking_url: trackingUrl, source: 'configured order adapter' };
+    }
+    case 'create_support_ticket': {
+      const url = process.env.SUPPORT_TICKET_WEBHOOK_URL;
+      if (!url) return { created: false, message: 'Support ticketing is not connected. Do not claim a ticket was created; offer a human follow-up.' };
+      const ticket = { subject: String(args.subject).slice(0, 140), description: String(args.description).slice(0, 1000), priority: args.priority || 'normal' };
+      const integration = await postIntegration(url, { ...context, ...ticket }, idempotencyKey);
+      const data = integration.data || {};
+      const ticketId = String(data.ticket_id || '').slice(0, 100);
+      const created = integration.configured && data.created === true && Boolean(ticketId);
+      return { created, ticket_id: created ? ticketId : '', message: created ? 'The connected support system confirmed the ticket.' : 'The support system did not confirm ticket creation.' };
+    }
     case 'update_lead_status':
       if (!leadStatuses.includes(args.status)) return { updated: false, message: 'Status was not changed because it is outside the supported set.' };
       {
@@ -122,13 +162,30 @@ export async function executeTool(name, args = {}, { idempotencyKey, context = {
   }
 }
 
+export async function dispatchHumanHandoff({ callId, prospect, product, reason, brief, messages }) {
+  const url = process.env.HUMAN_HANDOFF_WEBHOOK_URL;
+  if (!url) return { configured: false, transferred: false };
+  const transcript = (Array.isArray(messages) ? messages : []).slice(-80).map((message) => ({
+    role: ['user', 'assistant', 'operator'].includes(message.role) ? message.role : 'user',
+    content: String(message.content || '').slice(0, 1200)
+  }));
+  const integration = await postIntegration(url, {
+    call_id: String(callId || '').slice(0, 120), prospect: String(prospect || '').slice(0, 100),
+    product: String(product || '').slice(0, 120), reason: String(reason || '').slice(0, 240),
+    brief: { summary: String(brief?.summary || '').slice(0, 500), needs: String(brief?.needs || '').slice(0, 300), objections: String(brief?.objections || '').slice(0, 300), next_step: String(brief?.next_step || '').slice(0, 300) },
+    transcript
+  }, `handoff:${String(callId || '').slice(0, 120)}`);
+  const data = integration.data || {};
+  return { configured: true, transferred: data.transferred === true, reference: String(data.reference || '').slice(0, 100) };
+}
+
 export { leadStatuses };
 
 export function validateToolArguments(name, args) {
   if (!args || typeof args !== 'object' || Array.isArray(args)) return { ok: false, error: 'Arguments must be a JSON object.' };
   const allowed = {
     check_product_info: ['product', 'question'], calculate_pricing: ['product', 'quantity', 'plan'], generate_quote: ['product', 'quantity', 'plan'],
-    schedule_followup: ['requested_time', 'channel', 'notes'], update_lead_status: ['status', 'reason'], end_call: ['reason']
+    schedule_followup: ['requested_time', 'channel', 'notes'], check_order_status: ['order_id'], create_support_ticket: ['subject', 'description', 'priority'], update_lead_status: ['status', 'reason'], end_call: ['reason']
   }[name];
   if (!allowed || Object.keys(args).some((key) => !allowed.includes(key))) return { ok: false, error: 'Arguments contain unsupported fields.' };
   const stringField = (key, max, required = false) => typeof args[key] === 'string' && args[key].trim().length > 0 && args[key].length <= max || (!required && args[key] === undefined);
@@ -140,6 +197,10 @@ export function validateToolArguments(name, args) {
       return stringField('product', 120, true) && stringField('plan', 80) && (args.quantity === undefined || Number.isInteger(args.quantity) && args.quantity >= 1 && args.quantity <= 10000) ? { ok: true, value: args } : { ok: false, error: 'Product, plan, or quantity is invalid.' };
     case 'schedule_followup':
       return stringField('requested_time', 160, true) && stringField('channel', 20) && stringField('notes', 300) && (!args.channel || ['email', 'phone', 'demo', 'other'].includes(args.channel)) ? { ok: true, value: args } : { ok: false, error: 'Follow-up details are invalid.' };
+    case 'check_order_status':
+      return stringField('order_id', 120, true) ? { ok: true, value: { order_id: args.order_id.trim() } } : { ok: false, error: 'An order ID is required.' };
+    case 'create_support_ticket':
+      return stringField('subject', 140, true) && stringField('description', 1000, true) && (!args.priority || ['low', 'normal', 'high'].includes(args.priority)) ? { ok: true, value: args } : { ok: false, error: 'Support ticket details are invalid.' };
     case 'update_lead_status':
       return leadStatuses.includes(args.status) && stringField('reason', 300, true) ? { ok: true, value: args } : { ok: false, error: 'Lead status or reason is invalid.' };
     case 'end_call':
@@ -155,7 +216,14 @@ export function validateToolResult(name, result) {
   if (name === 'check_product_info' && typeof result.found !== 'boolean') return { ok: false, error: 'Product lookup result is malformed.' };
   if (['calculate_pricing', 'generate_quote'].includes(name) && typeof result.available !== 'boolean') return { ok: false, error: 'Quote result is malformed.' };
   if (name === 'schedule_followup' && typeof result.booked !== 'boolean') return { ok: false, error: 'Follow-up result is malformed.' };
+  if (name === 'check_order_status' && typeof result.found !== 'boolean') return { ok: false, error: 'Order lookup result is malformed.' };
+  if (name === 'create_support_ticket' && typeof result.created !== 'boolean') return { ok: false, error: 'Ticket creation result is malformed.' };
   if (name === 'update_lead_status' && typeof result.updated !== 'boolean') return { ok: false, error: 'Lead update result is malformed.' };
   if (name === 'end_call' && typeof result.end_call !== 'boolean') return { ok: false, error: 'End-call result is malformed.' };
   return { ok: true, value: result };
+}
+
+function safeHttpsUrl(value) {
+  try { const url = new URL(String(value || '')); return url.protocol === 'https:' ? url.toString().slice(0, 500) : ''; }
+  catch { return ''; }
 }

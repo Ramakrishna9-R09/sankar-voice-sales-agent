@@ -1,0 +1,6 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+numpy>=1.26,<3
+soundfile>=0.12,<1
+transformers>=4.51,<5
+torch>=2.6

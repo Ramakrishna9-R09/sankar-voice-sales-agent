@@ -12,6 +12,7 @@ export class EnergyVAD {
     this.frame = 0;
     this.speechFrames = 0;
     this.lastSpeechAt = 0;
+    this.firstSpeechAt = 0;
     this.noiseFloor = 0.003;
   }
   start(context, stream) {
@@ -40,12 +41,13 @@ export class EnergyVAD {
       const speechLike = rms >= threshold;
       this.onLevel(Math.min(1, rms / Math.max(threshold * 3, 0.04)), speechLike);
       if (speechLike) {
+        if (!this.speechFrames) this.firstSpeechAt = now;
         this.lastSpeechAt = now;
         this.speechFrames += 1;
-        if (!this.active && this.speechFrames >= 3) { this.active = true; this.onSpeechStart({ rms, threshold }); }
+        if (!this.active && this.speechFrames >= 3) { this.active = true; this.onSpeechStart({ rms, threshold, speechStartedAt: this.firstSpeechAt, detectedAt: now }); }
       } else {
         this.speechFrames = 0;
-        if (this.active && now - this.lastSpeechAt >= this.hangoverMs) { this.active = false; this.onSpeechEnd({ rms, threshold }); }
+        if (this.active && now - this.lastSpeechAt >= this.hangoverMs) { this.active = false; this.onSpeechEnd({ rms, threshold, speechEndedAt: this.lastSpeechAt, detectedAt: now }); }
       }
       this.frame = requestAnimationFrame(sample);
     };

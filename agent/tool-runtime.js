@@ -2,7 +2,7 @@ import { executeTool, validateToolArguments, validateToolResult } from './tools.
 import { logEvent, observeTool } from './observability.js';
 import { retryTransient } from './reliability.js';
 
-const READ_ONLY = new Set(['check_product_info', 'calculate_pricing', 'generate_quote']);
+const READ_ONLY = new Set(['check_product_info', 'calculate_pricing', 'generate_quote', 'check_order_status']);
 
 async function runOne(call, requestId, signal) {
   const { name, arguments: rawArgs = '', id } = call;

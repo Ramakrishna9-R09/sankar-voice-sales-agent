@@ -1,0 +1,86 @@
+name: sankar-voice
+
+services:
+  llm:
+    image: vllm/vllm-openai:v0.14.0
+    profiles: [voice-stack]
+    command:
+      - vllm
+      - serve
+      - ${LLM_MODEL:-Qwen/Qwen3-8B-AWQ}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --api-key
+      - ${LLM_API_KEY:-local-dev-key}
+      - --max-model-len
+      - "4096"
+      - --max-num-seqs
+      - "16"
+      - --gpu-memory-utilization
+      - "0.68"
+      - --enable-prefix-caching
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - hermes
+      - --reasoning-parser
+      - qwen3
+      - --default-chat-template-kwargs
+      - '{"enable_thinking":false}'
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    gpus: all
+    restart: unless-stopped
+
+  asr-hindi-english:
+    build: ./services/qwen-asr
+    profiles: [voice-stack]
+    environment:
+      ASR_ENGINE: qwen3
+      ASR_MODEL: Qwen/Qwen3-ASR-0.6B
+      ASR_GPU_MEMORY_UTILIZATION: "0.18"
+      ASR_CONCURRENCY: "4"
+      VOICE_GATEWAY_SECRET: ${VOICE_GATEWAY_SECRET:?Set VOICE_GATEWAY_SECRET in .env}
+    ports:
+      - "127.0.0.1:8100:8100"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    gpus: all
+    restart: unless-stopped
+
+  asr-tamil-telugu:
+    build: ./services/qwen-asr
+    profiles: [voice-stack]
+    environment:
+      ASR_ENGINE: whisper
+      ASR_MODEL: ${TAMIL_ASR_MODEL:-small}
+      ASR_DEVICE: ${TAMIL_ASR_DEVICE:-cpu}
+      ASR_COMPUTE_TYPE: ${TAMIL_ASR_COMPUTE_TYPE:-int8}
+      ASR_CPU_THREADS: ${TAMIL_ASR_CPU_THREADS:-4}
+      VOICE_GATEWAY_SECRET: ${VOICE_GATEWAY_SECRET:?Set VOICE_GATEWAY_SECRET in .env}
+    ports:
+      - "127.0.0.1:8101:8100"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    restart: unless-stopped
+
+  indic-tts:
+    build: ./services/indic-tts
+    profiles: [voice-stack]
+    environment:
+      INDIC_TTS_MODEL: ai4bharat/IndicF5
+      INDIC_TTS_REFERENCE_AUDIO: /voice-refs/agent.wav
+      INDIC_TTS_REFERENCE_TEXT: ${INDIC_TTS_REFERENCE_TEXT:?Set the exact transcript for your consented voice sample}
+    ports:
+      - "127.0.0.1:8011:8011"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+      - ./voice-refs:/voice-refs:ro
+    gpus: all
+    restart: unless-stopped
+
+volumes:
+  hf-cache:

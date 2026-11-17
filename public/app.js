@@ -1,5 +1,6 @@
 import { clearProspectMemory, getProspectMemory, rememberProspect } from './memory.js';
 import { EnergyVAD } from './voice-activity.js';
+import { cancelVoiceGeneration } from './voice-turn.js';
 
 (() => {
   'use strict';
@@ -21,7 +22,9 @@ import { EnergyVAD } from './voice-activity.js';
     streamMessage: null, speechQueue: [], speechQueueActive: false, speechGeneration: 0, speechController: null,
     interimText: '', vadTimer: null, autoEndCall: false, suggestedStatus: '', toolActions: [],
     humanControl: false, openedCallId: null, playbackCallId: null, activeTurnStats: null,
-    callMetrics: null, metricsRefreshTimer: null
+    callMetrics: null, metricsRefreshTimer: null, serviceHealth: null, sttMode: 'browser',
+    sttSocket: null, workletNode: null, vadSpeechStartedAt: null,
+    frustrationSignals: 0, lastUserUtterance: '', repeatedUserTurns: 0, activeCallId: null
   };
 
   const escapeHTML = (value = '') => String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -71,14 +74,14 @@ import { EnergyVAD } from './voice-activity.js';
   async function checkService() {
     const label = $('#connection-label'), wrap = $('.environment-label'), title = $('#engine-title'), description = $('#engine-description'), card = $('#setup-card');
     try {
-      const health = await api('/api/health', null, { method: 'GET' }); state.configured = health.configured;
-      if (state.configured) {
+      const health = await api('/api/health', null, { method: 'GET' }); state.configured = health.configured; state.serviceHealth = health; state.sttMode = health.sttAvailable ? 'qwen3' : 'browser';
+      if (state.configured && health.reachable !== false) {
         label.textContent = 'AI engine connected'; wrap.className = 'environment-label ready';
-        title.textContent = 'Ready for a real conversation'; description.textContent = `${health.chatModel} · Groq Orpheus voice · streaming agent`;
+        title.textContent = 'Ready for a real conversation'; description.textContent = `${health.chatModel} · ${health.provider} · ${health.voice}`;
         card.classList.add('connected');
       } else {
-        label.textContent = 'AI setup required'; wrap.className = 'environment-label error';
-        title.textContent = 'Connect your AI engine'; description.textContent = 'Add a server-side API key to enable AI conversation and voice.';
+        label.textContent = state.configured ? 'Local model unavailable' : 'AI setup required'; wrap.className = 'environment-label error';
+        title.textContent = state.configured ? 'Start the model services' : 'Connect your AI engine'; description.textContent = state.configured ? 'The local model endpoint is configured but not reachable. Start the vLLM service and retry.' : 'Configure the open-model endpoint or add a server-side hosted-provider key.';
         card.classList.remove('connected');
       }
     } catch {
@@ -147,12 +150,17 @@ import { EnergyVAD } from './voice-activity.js';
   }
 
   function freshCallMetrics() {
-    return { turns: 0, errors: 0, interruptions: 0, tool_calls: 0, input_tokens: 0, output_tokens: 0, time_to_first_token_ms: [], time_to_first_audio_ms: [], turn_total_ms: [], events: [] };
+    return { turns: 0, errors: 0, interruptions: 0, tool_calls: 0, input_tokens: 0, output_tokens: 0, time_to_first_token_ms: [], time_to_first_audio_byte_ms: [], time_to_first_audio_ms: [], interruption_cancel_ms: [], stt_finalize_ms: [], stt_mean_log_probability: [], turn_total_ms: [], events: [] };
   }
   function trackCallMetric(name, value) {
     if (!state.callMetrics || !Number.isFinite(value) || value < 0) return;
     if (Array.isArray(state.callMetrics[name])) state.callMetrics[name].push(Math.round(value));
     state.callMetrics.events.push({ name, value_ms: Math.round(value) });
+  }
+  function trackSTTDiagnostic(value) {
+    if (!state.callMetrics || !Number.isFinite(value) || value < -30 || value > 0) return;
+    state.callMetrics.stt_mean_log_probability.push(value);
+    state.callMetrics.events.push({ name: 'stt_mean_log_probability', value });
   }
 
   function updateBrief() {
@@ -214,16 +222,72 @@ import { EnergyVAD } from './voice-activity.js';
       state.recorder.start(1000);
     } else state.audioNode.connect(state.audioContext.destination);
     state.vad = new EnergyVAD({
-      onSpeechStart: () => {
+      onSpeechStart: ({ speechStartedAt } = {}) => {
+        state.vadSpeechStartedAt = Number.isFinite(speechStartedAt) ? speechStartedAt : performance.now();
         setVADActive(true);
-        if (state.speaking || state.thinking) interruptAssistant();
+        state.workletNode?.port.postMessage({ type: 'speech', active: true });
+        if (state.speaking || state.thinking) { trackCallMetric('barge_in', 1); interruptAssistant(); }
       },
-      onSpeechEnd: () => {
+      onSpeechEnd: ({ speechEndedAt, detectedAt } = {}) => {
         setVADActive(false);
-        if (state.interimText && state.active && !state.thinking) submitUtterance(state.interimText);
+        state.workletNode?.port.postMessage({ type: 'speech', active: false });
+        state.lastUtteranceEndedAt = Number.isFinite(speechEndedAt) ? speechEndedAt : Number.isFinite(detectedAt) ? detectedAt : performance.now();
+        if (state.sttSocket?.readyState === WebSocket.OPEN) {
+          state.sttFinalizeStartedAt = state.lastUtteranceEndedAt;
+          state.sttSocket.send(JSON.stringify({ type: 'end' }));
+        } else if (state.interimText && state.active && !state.thinking) submitUtterance(state.interimText);
       }
     });
     state.vad.start(state.audioContext, state.stream);
+  }
+
+  async function connectStreamingSTT() {
+    const session = await api('/api/stt/session', { language: state.prefs.language });
+    const url = new URL(session.url);
+    url.searchParams.set('token', session.token);
+    const socket = new WebSocket(url);
+    state.sttSocket = socket;
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Streaming speech service did not connect in time.')), 7000);
+      socket.onopen = () => { clearTimeout(timeout); resolve(); };
+      socket.onerror = () => { clearTimeout(timeout); reject(new Error('Streaming speech service is unavailable.')); };
+    });
+    socket.binaryType = 'arraybuffer';
+    socket.onmessage = (message) => {
+      let event;
+      try { event = JSON.parse(message.data); } catch { return; }
+      if (event.type === 'partial') {
+        state.interimText = String(event.text || '').trim();
+        if (state.interimText) $('#stage-caption').textContent = `Hearing: “${state.interimText.slice(0, 90)}”`;
+      } else if (event.type === 'final') {
+        if (event.mean_log_probability != null) trackSTTDiagnostic(Number(event.mean_log_probability));
+        const elapsed = Number.isFinite(state.sttFinalizeStartedAt) ? performance.now() - state.sttFinalizeStartedAt : null;
+        if (elapsed != null) trackCallMetric('stt_finalize_ms', elapsed);
+        if (Number.isFinite(state.sttFinalizeStartedAt)) state.lastUtteranceEndedAt = state.sttFinalizeStartedAt;
+        state.sttFinalizeStartedAt = null;
+        const words = String(event.text || state.interimText || '').trim();
+        state.interimText = '';
+        if (state.ending) { if (words) addMessage('user', words); state.sttFlushResolver?.(); }
+        else if (words) submitUtterance(words);
+        else { setVoiceState('listening'); $('#stage-caption').textContent = 'I did not catch that clearly. Please try again.'; }
+      } else if (event.type === 'error') {
+        showNotice(`Streaming transcription failed: ${String(event.message || 'unknown error')}`);
+      }
+    };
+    socket.onclose = () => {
+      if (state.sttSocket === socket) state.sttSocket = null;
+      if (state.active && state.sttMode === 'qwen3' && SpeechRecognition) {
+        state.sttMode = 'browser'; showNotice('Streaming speech disconnected. Continuing with browser speech recognition.'); startRecognition(state.speaking);
+      }
+    };
+    await state.audioContext.audioWorklet.addModule('./pcm-capture-worklet.js');
+    const node = new AudioWorkletNode(state.audioContext, 'pcm-capture', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
+    node.port.onmessage = ({ data }) => { if (socket.readyState === WebSocket.OPEN) socket.send(data); };
+    const source = state.audioContext.createMediaStreamSource(state.stream);
+    const silent = state.audioContext.createGain(); silent.gain.value = 0;
+    source.connect(node); node.connect(silent); silent.connect(state.audioContext.destination);
+    state.workletNode = node;
+    socket.send(JSON.stringify({ type: 'start', language: session.language }));
   }
 
   const stageNames = { introduction: 'INTRODUCTION', discovery: 'DISCOVERY', pitch: 'VALUE PITCH', objection_handling: 'OBJECTION HANDLING', closing: 'CLOSING', summary_generation: 'SUMMARY' };
@@ -243,9 +307,24 @@ import { EnergyVAD } from './voice-activity.js';
     setVoiceState('speaking'); $('#stage-caption').textContent = 'Streaming AI voice · speak any time to interrupt';
     const controller = new AbortController(); state.speechController = controller;
     try {
-      const response = await api('/api/speech', { text }, { raw: true, signal: controller.signal });
+      const response = await api('/api/speech', { text, language: state.prefs.language }, { raw: true, signal: controller.signal });
       if (!state.active || generation !== state.speechGeneration) return;
-      const blob = await response.blob();
+      const chunks = [];
+      const reader = response.body?.getReader();
+      if (reader) {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value?.byteLength) {
+            if (turnStats && turnStats.firstAudioByteMs == null) {
+              turnStats.firstAudioByteMs = performance.now() - turnStats.startedAt;
+              trackCallMetric('time_to_first_audio_byte_ms', turnStats.firstAudioByteMs);
+            }
+            chunks.push(value);
+          }
+        }
+      }
+      const blob = new Blob(chunks, { type: response.headers.get('content-type') || 'audio/wav' });
       if (state.audioUrl) URL.revokeObjectURL(state.audioUrl);
       state.audioUrl = URL.createObjectURL(blob);
       state.audioElement.src = state.audioUrl;
@@ -259,7 +338,7 @@ import { EnergyVAD } from './voice-activity.js';
       await ended;
     } catch (error) {
       if (error.name !== 'AbortError' && state.active && generation === state.speechGeneration) {
-        showNotice(`Voice generation failed: ${error.message}. The transcript is still available; check Groq model access.`);
+        showNotice(`Voice generation failed: ${error.message}. The transcript is still available; check the configured speech model service.`);
         $('#stage-caption').textContent = 'Voice unavailable · listening for the prospect';
         startRecognition();
       }
@@ -290,21 +369,19 @@ import { EnergyVAD } from './voice-activity.js';
   }
 
   function interruptAssistant() {
-    if (!state.speaking && !state.thinking) return;
-    state.speechGeneration += 1; state.speechQueue = []; state.autoEndCall = false;
-    state.turnController?.abort(); state.turnController = null; state.speechController?.abort(); state.speechController = null; state.thinking = false; state.speaking = false;
-    if (state.streamMessage) {
-      state.messages = state.messages.filter((message) => message !== state.streamMessage);
-      state.streamMessage = null; renderMessages();
-    }
-    if (state.audioElement) { state.audioElement.pause(); state.audioElement.removeAttribute('src'); }
+    if (!cancelVoiceGeneration(state, renderMessages)) return;
     if (state.audioUrl) { URL.revokeObjectURL(state.audioUrl); state.audioUrl = null; }
+    if (state.callMetrics && state.vadSpeechStartedAt != null) trackCallMetric('interruption_cancel_ms', performance.now() - state.vadSpeechStartedAt);
+    state.vadSpeechStartedAt = null;
     setVoiceState('listening'); $('#stage-caption').textContent = 'Assistant paused · listening to the prospect';
   }
 
   async function requestTurn(instruction = '') {
     const turnId = ++state.turnSequence;
-    const turnStats = { startedAt: performance.now(), firstTokenMs: null, firstAudioMs: null, serverMetrics: null };
+    const requestStartedAt = performance.now();
+    const turnStartedAt = Number.isFinite(state.lastUtteranceEndedAt) ? state.lastUtteranceEndedAt : requestStartedAt;
+    state.lastUtteranceEndedAt = null;
+    const turnStats = { startedAt: turnStartedAt, requestStartedAt, requestOffsetMs: requestStartedAt - turnStartedAt, firstTokenMs: null, firstAudioByteMs: null, firstAudioMs: null, serverMetrics: null };
     state.activeTurnStats = turnStats;
     if (state.callMetrics) state.callMetrics.turns += 1;
     state.turnController?.abort(); state.turnController = new AbortController();
@@ -322,11 +399,12 @@ import { EnergyVAD } from './voice-activity.js';
         let event; try { event = JSON.parse(line.slice(5).trim()); } catch { return; }
         if (event.type === 'stage') updateAgentStage(event.stage);
         else if (event.type === 'intent') updateIntent(event.intent);
-        else if (event.type === 'delta') {
+        else if (event.type === 'first_token') {
           if (turnStats.firstTokenMs == null) {
-            turnStats.firstTokenMs = performance.now() - turnStats.startedAt;
+            turnStats.firstTokenMs = (Number(event.elapsed_ms) || performance.now() - turnStats.requestStartedAt) + turnStats.requestOffsetMs;
             trackCallMetric('time_to_first_token_ms', turnStats.firstTokenMs);
           }
+        } else if (event.type === 'delta') {
           if (!state.streamMessage) {
             state.streamMessage = { role: 'assistant', content: '', time: new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date()), offset_ms: state.startedAt ? Date.now() - state.startedAt : null };
             state.messages.push(state.streamMessage);
@@ -335,7 +413,7 @@ import { EnergyVAD } from './voice-activity.js';
           renderMessages();
         } else if (event.type === 'sentence') enqueueSpeech(event.text, turnStats);
         else if (event.type === 'tool') {
-          $('#stage-caption').textContent = ({ check_product_info: 'Checking verified product information', calculate_pricing: 'Checking verified pricing', generate_quote: 'Preparing a verified quote', schedule_followup: 'Capturing follow-up request', update_lead_status: 'Updating lead outcome', end_call: 'Wrapping up the call' })[event.name] || 'Working on the next step';
+          $('#stage-caption').textContent = ({ check_product_info: 'Checking verified product information', calculate_pricing: 'Checking verified pricing', generate_quote: 'Preparing a verified quote', schedule_followup: 'Capturing follow-up request', check_order_status: 'Checking the connected order system', create_support_ticket: 'Creating a support request', update_lead_status: 'Updating lead outcome', end_call: 'Wrapping up the call' })[event.name] || 'Working on the next step';
           if (event.action) state.toolActions.push(event.action);
           if (state.callMetrics) state.callMetrics.tool_calls += 1;
         }
@@ -385,20 +463,57 @@ import { EnergyVAD } from './voice-activity.js';
     if (state.thinking && !state.speaking) return; // Ignore a late final STT event after the VAD silence timer submitted the same phrase.
     clearTimeout(state.vadTimer); state.vadTimer = null; state.interimText = '';
     if (state.speaking || state.thinking) interruptAssistant();
+    if (!Number.isFinite(state.lastUtteranceEndedAt)) state.lastUtteranceEndedAt = performance.now();
     try { state.recognizer?.stop(); } catch { /* already stopped */ }
     state.recognizer = null; addMessage('user', words); updateIntent('neutral');
     if (state.humanControl) { state.thinking = false; setVoiceState('listening', 'Human operator has control.'); startRecognition(); return; }
+    const handoffReason = humanHandoffReason(words);
+    if (handoffReason) { trackCallMetric('handoff_auto', 1); void takeOverCall(handoffReason); return; }
     state.thinking = true; setVoiceState('thinking');
     void requestTurn();
   }
 
-  function takeOverCall() {
+  function humanHandoffReason(text) {
+    if (/\b(speak|talk|connect|transfer|put me through)\b.{0,30}\b(human|person|representative|manager|agent|someone|a real person)\b|\b(human|person|representative|manager|real agent)\b.{0,30}\b(please|now|instead)\b/i.test(text)) return 'Prospect explicitly requested a human.';
+    if (/\b(frustrated|angry|upset|not listening|wasting my time|already told you|stop repeating|useless|annoying|ridiculous)\b/i.test(text)) state.frustrationSignals += 1;
+    if (state.frustrationSignals) { $('#sentiment-label').hidden = false; $('#sentiment-label').textContent = 'FRUSTRATION SIGNAL'; }
+    const normalized = text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+    if (normalized && normalized === state.lastUserUtterance) state.repeatedUserTurns += 1;
+    else state.repeatedUserTurns = 0;
+    state.lastUserUtterance = normalized;
+    if (state.frustrationSignals >= 2) return 'Repeated frustration signals detected.';
+    if (state.repeatedUserTurns >= 2) return 'The prospect appears stuck in a repeated conversation loop.';
+    return '';
+  }
+
+  function takeOverCall(reason = 'Operator requested control.') {
     if (!state.active || state.ending) return;
     if (state.speaking || state.thinking) interruptAssistant();
     state.humanControl = true;
     $('#takeover-call').hidden = true; $('#resume-ai').hidden = false; $('#operator-panel').hidden = false;
-    setVoiceState('listening', 'Human operator has control.'); $('#stage-caption').textContent = 'Human operator in control';
-    startRecognition(); $('#operator-message').focus(); toast('AI paused. You can speak to the prospect or send a typed voice response.');
+    setVoiceState('listening', 'Human operator has control.'); $('#stage-caption').textContent = 'Human handoff requested · operator in control';
+    startRecognition(); $('#operator-message').focus();
+    const summary = $('#handoff-summary'); summary.hidden = false; summary.textContent = `Preparing handoff brief · ${reason}`;
+    const messages = state.messages.map(({ role, content }) => ({ role, content }));
+    const transferToOperator = async (brief) => {
+      try {
+        const transfer = await api('/api/handoff', { call_id: state.activeCallId, prospect: state.prefs.prospect, product: state.prefs.product, reason, brief, messages });
+        summary.textContent += transfer.transferred ? `\n\nTransferred · ${transfer.reference || 'operator service confirmed'}` : '\n\nLocal operator has control. No connected transfer service confirmed a remote handoff.';
+      } catch { summary.textContent += '\n\nLocal operator has control. The configured transfer service did not confirm a remote handoff.'; }
+    };
+    void api('/api/handoff-summary', { product: state.prefs.product, prospect: state.prefs.prospect, messages })
+      .then(async (brief) => {
+        summary.textContent = `HANDOFF BRIEF\n${brief.summary || 'Summary unavailable.'}\nNeeds: ${brief.needs || 'Not established.'}\nObjections: ${brief.objections || 'None captured.'}\nNext step: ${brief.next_step || 'Operator to assess.'}`;
+        await transferToOperator(brief);
+      })
+      .catch(async () => {
+        // A model outage must not strand an explicit human request. Send a clearly marked
+        // fallback brief with the transcript and keep the browser operator in control.
+        const brief = { summary: 'AI summary unavailable. Review the attached transcript.', needs: 'Review transcript', objections: 'Review transcript', next_step: 'Operator to assess.' };
+        summary.textContent = `HANDOFF BRIEF\n${brief.summary}\nReason: ${reason}`;
+        await transferToOperator(brief);
+      });
+    toast('AI paused. The prospect is handed to the available operator in this workspace.');
   }
 
   function resumeAI() {
@@ -421,7 +536,7 @@ import { EnergyVAD } from './voice-activity.js';
   }
 
   function startRecognition(duringAssistant = false) {
-    if (!state.active || (!duringAssistant && state.thinking) || !SpeechRecognition || state.recognizer) return;
+    if (state.sttMode === 'qwen3' || !state.active || (!duringAssistant && state.thinking) || !SpeechRecognition || state.recognizer) return;
     const recognizer = new SpeechRecognition(); state.recognizer = recognizer;
     recognizer.lang = 'en-IN'; recognizer.continuous = true; recognizer.interimResults = true; recognizer.maxAlternatives = 1;
     recognizer.onstart = () => { if (!state.speaking) setVoiceState('listening'); };
@@ -459,10 +574,13 @@ import { EnergyVAD } from './voice-activity.js';
 
   async function startCall() {
     $('#call-notice').hidden = true;
-    if (!state.configured) { await checkService(); if (!state.configured) { openModal('settings-modal'); return; } }
-    if (!SpeechRecognition) { showNotice('Live speech recognition is not available in this browser. Open the app in Chrome or Edge on localhost or HTTPS.'); return; }
+    if (!state.configured || state.serviceHealth?.reachable === false) await checkService();
+    if (!state.configured) { openModal('settings-modal'); return; }
+    if (state.serviceHealth?.reachable === false) { showNotice('The local model endpoint is offline. Start the configured model service and try again.'); return; }
+    if (state.sttMode !== 'qwen3' && !SpeechRecognition) { showNotice('Speech recognition is unavailable. Configure the self-hosted Qwen streaming service or open this app in Chrome or Edge.'); return; }
     if (!navigator.mediaDevices?.getUserMedia) { showNotice('This browser cannot access a microphone. Use a secure localhost or HTTPS connection.'); return; }
-    state.messages = []; state.stage = 'introduction'; state.intent = 'neutral'; state.memory = null; state.suggestedStatus = ''; state.toolActions = []; state.speechQueue = []; state.autoEndCall = false; state.humanControl = false; state.callMetrics = freshCallMetrics(); state.openedCallId = null; state.playbackCallId = null;
+    state.messages = []; state.stage = 'introduction'; state.intent = 'neutral'; state.memory = null; state.suggestedStatus = ''; state.toolActions = []; state.speechQueue = []; state.autoEndCall = false; state.humanControl = false; state.callMetrics = freshCallMetrics(); state.openedCallId = null; state.playbackCallId = null; state.frustrationSignals = 0; state.lastUserUtterance = ''; state.repeatedUserTurns = 0; state.activeCallId = id();
+    trackCallMetric('call_started', 1);
     renderMessages(); resetInsights(); $('#call-timer').textContent = '00:00'; updateAgentStage(state.stage); updateIntent(state.intent);
     $('#start-call').disabled = true;
     try {
@@ -471,12 +589,24 @@ import { EnergyVAD } from './voice-activity.js';
         catch { state.memory = null; showNotice('Returning-prospect memory could not be loaded; this call will continue without it.'); }
       }
       state.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      state.stream.getAudioTracks().forEach((track) => track.addEventListener('ended', () => {
+        if (state.active && !state.ending) { trackCallMetric('call_dropped', 1); showNotice('The microphone connection ended. This call is being saved.'); void finishCall(true); }
+      }, { once: true }));
       setCallState(true);
       updateAgentStage(state.stage); updateIntent(state.intent);
       if ($('#record-consent').checked) {
         if (!window.MediaRecorder) { showNotice('This browser does not support recording. The conversation can continue without recording.'); $('#record-consent').checked = false; }
         else await createAudioGraph(true);
       } else await createAudioGraph(false);
+      if (state.sttMode === 'qwen3') {
+        try { await connectStreamingSTT(); }
+        catch (error) {
+          state.sttMode = 'browser';
+          state.sttSocket?.close(); state.sttSocket = null;
+          if (!SpeechRecognition) throw error;
+          showNotice(`Streaming speech is unavailable (${error.message}); using browser recognition for this call.`);
+        }
+      }
       const returning = state.memory?.last_outcome ? `This is a returning prospect. Use the local memory discreetly; do not repeat old objections unless relevant. Previous outcome: ${state.memory.last_outcome}.` : '';
       await requestTurn(`Open the call with a brief natural greeting, introduce yourself as Sankar Group’s AI sales assistant, say you would like to understand the prospect’s situation, and ask one friendly discovery question. Do not make up product facts. ${returning}`);
     } catch (error) {
@@ -500,6 +630,7 @@ import { EnergyVAD } from './voice-activity.js';
   async function finishCall(silent = false) {
     if ((!state.active && !state.stream) || state.ending) return;
     state.ending = true; state.turnSequence += 1; state.turnController?.abort(); state.turnController = null;
+    await flushStreamingSTT();
     updateAgentStage('summary_generation');
     clearTimeout(state.vadTimer); state.vadTimer = null; state.speechGeneration += 1; state.speechQueue = []; state.autoEndCall = false;
     state.speechController?.abort(); state.speechController = null;
@@ -508,6 +639,10 @@ import { EnergyVAD } from './voice-activity.js';
     $('#agent-stage').hidden = true; $('#intent-label').hidden = true;
     try { state.recognizer?.stop(); } catch { /* no active recognizer */ }
     state.recognizer = null;
+    state.workletNode?.port.postMessage({ type: 'speech', active: false });
+    try { state.workletNode?.disconnect(); } catch { /* already disconnected */ }
+    state.workletNode = null;
+    state.sttSocket?.close(1000, 'call ended'); state.sttSocket = null;
     if (state.audioElement) { state.audioElement.pause(); state.audioElement.removeAttribute('src'); }
     state.vad?.stop(); state.vad = null; setVADActive(false);
     if (state.stream) { state.stream.getTracks().forEach((track) => track.stop()); state.stream = null; }
@@ -519,7 +654,7 @@ import { EnergyVAD } from './voice-activity.js';
     try { await state.audioContext?.close(); } catch { /* already closed */ }
     state.audioContext = null; state.audioDestination = null; state.audioNode = null; state.audioElement = null;
     const cleanMessages = state.messages.filter((m) => !m.internal);
-    let audioSaved = false; const callId = id();
+    let audioSaved = false; const callId = state.activeCallId || id();
     if (blob?.size > 1200) { try { await putAudio(callId, blob); audioSaved = true; } catch { showNotice('The transcript was saved, but browser storage could not save the recording.'); } }
     const summary = await buildSummary();
     if (state.suggestedStatus) summary.status = state.suggestedStatus;
@@ -541,6 +676,19 @@ import { EnergyVAD } from './voice-activity.js';
     state.ending = false; $('#start-call').disabled = false; $('#state-label').textContent = 'READY';
     setVoiceState('ready'); $('#stage-caption').textContent = audioSaved ? 'Call and recording saved on this device' : 'Call transcript and analysis saved';
     if (!silent) toast(audioSaved ? 'Call recording, transcript, and analysis saved.' : 'Call transcript and analysis saved.');
+  }
+
+  function flushStreamingSTT() {
+    const socket = state.sttSocket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return Promise.resolve();
+    state.workletNode?.port.postMessage({ type: 'speech', active: false });
+    state.sttFinalizeStartedAt ||= performance.now();
+    return new Promise((resolve) => {
+      const done = () => { clearTimeout(timer); if (state.sttFlushResolver === done) state.sttFlushResolver = null; resolve(); };
+      const timer = setTimeout(done, 2200);
+      state.sttFlushResolver = done;
+      try { socket.send(JSON.stringify({ type: 'end' })); } catch { done(); }
+    });
   }
 
   function statusClass(status) {
@@ -590,8 +738,11 @@ import { EnergyVAD } from './voice-activity.js';
       const toolCalls = tools.reduce((sum, item) => sum + item.calls, 0);
       const toolErrors = tools.reduce((sum, item) => sum + item.errors, 0);
       const toolSuccess = toolCalls ? `${Math.round((toolCalls - toolErrors) / toolCalls * 100)}%` : '—';
-      host.innerHTML = `<div class="ops-metric"><span>Time to first token · p50</span><strong>${fmt(metrics.voice?.time_to_first_token_ms?.p50_ms)}</strong></div><div class="ops-metric"><span>Time to first audio · p50</span><strong>${fmt(metrics.voice?.time_to_first_audio_ms?.p50_ms)}</strong></div><div class="ops-metric"><span>Turn latency · p95</span><strong>${fmt(metrics.turns?.p95_ms)}</strong></div><div class="ops-metric"><span>Turn error rate</span><strong>${Math.round((metrics.turns?.error_rate || 0) * 100)}%</strong></div><div class="ops-metric"><span>Groq request errors</span><strong>${Math.round((metrics.groq?.error_rate || 0) * 100)}%</strong></div><div class="ops-metric"><span>Tool success · calls</span><strong>${toolSuccess} · ${toolCalls} <small>(${toolErrors} failed)</small></strong></div><div class="ops-metric"><span>Tokens · input / output</span><strong>${Number(metrics.groq?.input_tokens || 0).toLocaleString()} / ${Number(metrics.groq?.output_tokens || 0).toLocaleString()}</strong></div>`;
-      $('#metrics-scope').textContent = `${metrics.scope || 'Instance-local'} · circuit ${metrics.circuit?.state || 'unknown'} · window resets after 15 minutes.`;
+      const llm = metrics.llm || metrics.groq || {};
+      host.innerHTML = `<div class="ops-metric"><span>Time to first token · p50</span><strong>${fmt(metrics.voice?.time_to_first_token_ms?.p50_ms)}</strong></div><div class="ops-metric"><span>Time to first audio byte · p50</span><strong>${fmt(metrics.voice?.time_to_first_audio_byte_ms?.p50_ms)}</strong></div><div class="ops-metric"><span>Playback start · p50</span><strong>${fmt(metrics.voice?.time_to_first_audio_ms?.p50_ms)}</strong></div><div class="ops-metric"><span>End-to-end turn · p95</span><strong>${fmt(metrics.voice?.turn_total_ms?.p95_ms)}</strong></div><div class="ops-metric"><span>Turn error rate</span><strong>${Math.round((metrics.turns?.error_rate || 0) * 100)}%</strong></div><div class="ops-metric"><span>${escapeHTML(metrics.provider || 'LLM')} request errors</span><strong>${Math.round((llm.error_rate || 0) * 100)}%</strong></div><div class="ops-metric"><span>Barge-in cancel · p50</span><strong>${fmt(metrics.voice?.interruption_cancel_ms?.p50_ms)}</strong></div><div class="ops-metric"><span>Barge-in events</span><strong>${Number(metrics.voice?.barge_in_count || 0).toLocaleString()}</strong></div><div class="ops-metric"><span>STT finalize · p50</span><strong>${fmt(metrics.voice?.stt_finalize_ms?.p50_ms)}</strong></div><div class="ops-metric"><span>STT mean log-probability · p50</span><strong>${metrics.stt?.mean_log_probability_p50 == null ? '—' : Number(metrics.stt.mean_log_probability_p50).toFixed(2)} <small>${Number(metrics.stt?.scored_utterances || 0)} samples</small></strong></div><div class="ops-metric"><span>Call drop rate</span><strong>${Math.round((metrics.voice?.call_drop_rate || 0) * 100)}% <small>(${metrics.voice?.call_drops || 0}/${metrics.voice?.call_starts || 0})</small></strong></div><div class="ops-metric"><span>Automatic handoffs</span><strong>${Number(metrics.voice?.automatic_handoff_count || 0).toLocaleString()}</strong></div><div class="ops-metric"><span>Tool success · calls</span><strong>${toolSuccess} · ${toolCalls} <small>(${toolErrors} failed)</small></strong></div><div class="ops-metric"><span>Tokens · input / output</span><strong>${Number(llm.input_tokens || 0).toLocaleString()} / ${Number(llm.output_tokens || 0).toLocaleString()}</strong></div>`;
+      const audioAttainment = metrics.voice?.first_audio_target_attainment;
+      host.insertAdjacentHTML('beforeend', `<div class="ops-metric"><span>Playback within ${Number(metrics.voice?.first_audio_target_ms || 800)} ms</span><strong>${audioAttainment == null ? '—' : `${Math.round(audioAttainment * 100)}%`} <small>${Number(metrics.voice?.time_to_first_audio_ms?.count || 0)} samples</small></strong></div>`);
+      $('#metrics-scope').textContent = `${metrics.scope || 'Instance-local'} · LLM circuit ${metrics.circuit?.state || 'unknown'} · speech circuit ${metrics.speech_circuit?.state || 'unknown'} · window resets after 15 minutes.`;
     } catch {
       host.innerHTML = '<div class="ops-metric"><span>Runtime telemetry</span><strong>Unavailable</strong></div>';
       $('#metrics-scope').textContent = 'Metrics endpoint is unavailable. Call handling is unaffected.';
@@ -667,13 +818,13 @@ import { EnergyVAD } from './voice-activity.js';
 
   function openModal(modalId) {
     if (modalId === 'details-modal') {
-      $('#input-prospect').value = state.prefs.prospect; $('#input-product').value = state.prefs.product; $('#input-goal').value = state.prefs.goal;
+      $('#input-prospect').value = state.prefs.prospect; $('#input-product').value = state.prefs.product; $('#input-goal').value = state.prefs.goal; $('#input-language').value = state.prefs.language || DEFAULTS.language;
     }
-    $('#'+modalId).hidden = false; setTimeout(() => $('#'+modalId+' input, #'+modalId+' textarea')?.focus(), 40);
+    $('#'+modalId).hidden = false; setTimeout(() => $('#'+modalId+' input, #'+modalId+' textarea, #'+modalId+' select')?.focus(), 40);
   }
   function closeModal(modalId) { $('#'+modalId).hidden = true; }
   function saveBrief() {
-    state.prefs = { ...state.prefs, prospect: $('#input-prospect').value.trim(), product: $('#input-product').value.trim() || DEFAULTS.product, goal: $('#input-goal').value.trim() || DEFAULTS.goal };
+    state.prefs = { ...state.prefs, prospect: $('#input-prospect').value.trim(), product: $('#input-product').value.trim() || DEFAULTS.product, goal: $('#input-goal').value.trim() || DEFAULTS.goal, language: $('#input-language').value || DEFAULTS.language };
     localStorage.setItem(PREFS_KEY, JSON.stringify(state.prefs)); updateBrief(); closeModal('details-modal'); toast('Call brief saved on this device.');
   }
 
