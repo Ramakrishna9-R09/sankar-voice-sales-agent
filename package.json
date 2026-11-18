@@ -5,6 +5,7 @@
   "description": "Open-model voice sales agent with Indian-language speech, verified product grounding, and operational telemetry",
   "type": "module",
   "scripts": {
+    "postinstall": "node scripts/copy-vad-assets.js",
     "dev": "node --watch server.js",
     "start": "node server.js",
     "test": "node --test",
@@ -12,8 +13,10 @@
     "eval:wer": "node scripts/asr-wer.js"
   },
   "dependencies": {
+    "@ricky0123/vad-web": "^0.0.31",
     "dotenv": "^16.4.7",
     "express": "^5.1.0",
-    "helmet": "^8.1.0"
+    "helmet": "^8.1.0",
+    "onnxruntime-web": "^1.22.0"
   }
 }

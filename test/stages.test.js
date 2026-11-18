@@ -17,3 +17,30 @@ test('evaluation clamps judge scores and includes operator speech in talk share'
   assert.equal(result.evaluation.factuality_and_compliance, 10);
   assert.deepEqual(talkListenRatio(messages), { prospect_percent: 50, assistant_percent: 50, prospect_words: 5, assistant_words: 5 });
 });
+
+test('evaluation audit flags unsupported commercial claims and missing qualification evidence', () => {
+  const messages = [
+    { role: 'user', content: 'We want a CRM tool for our sales team.' },
+    { role: 'assistant', content: 'It includes guaranteed 99.99% uptime.' }
+  ];
+  const result = normalizeEvaluation({
+    risk_flags: Array.from({ length: 8 }, (_item, index) => `Model flag ${index + 1}`),
+    evaluation: { suggested_improvements: [] }
+  }, messages, []);
+  assert.match(result.risk_flags[0], /unsupported commercial claim/i);
+  assert.ok(result.risk_flags.some((flag) => /Lead qualification is incomplete/i.test(flag)));
+  assert.match(result.evaluation.suggested_improvements[0], /buying timeline/);
+});
+
+test('evaluation audit accepts a claim that is supported by the surfaced retrieval source', () => {
+  const messages = [
+    { role: 'user', content: 'We need a CRM to save reporting time. Our sales manager will decide next month.' },
+    { role: 'assistant', content: 'Nexus CRM includes WhatsApp lead inbox for sales teams.' }
+  ];
+  const actions = [{
+    name: 'check_product_info', product: 'Nexus CRM',
+    sources: [{ kind: 'feature', text: 'Nexus CRM includes WhatsApp lead inbox for sales teams.' }]
+  }];
+  const result = normalizeEvaluation({}, messages, actions);
+  assert.deepEqual(result.risk_flags, []);
+});

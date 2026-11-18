@@ -1,4 +1,4 @@
-import { retrieveKnowledge } from './knowledge.js';
+import { retrieveKnowledgeHybrid } from './knowledge.js';
 
 const leadStatuses = ['Converted', 'Interested', 'Follow-up Required', 'Not Interested', 'Demo Requested', 'No Response'];
 
@@ -106,7 +106,8 @@ async function postIntegration(urlValue, payload, idempotencyKey) {
 export async function executeTool(name, args = {}, { idempotencyKey, context = {} } = {}) {
   switch (name) {
     case 'check_product_info': {
-      const results = retrieveKnowledge(args.question, args.product, { limit: 4 });
+      const retrieval = await retrieveKnowledgeHybrid(args.question, args.product, { limit: 4 });
+      const results = retrieval.items;
       return results.length
         ? { found: true, product: results[0].product, sources: results.map(({ kind, text, source }) => ({ kind, text, source })), message: results.map((item) => item.text).join(' ') }
         : { found: false, product: args.product, sources: [], message: 'No matching verified product documentation is configured. Do not guess product capabilities; offer a sales follow-up.' };
@@ -172,7 +173,7 @@ export async function dispatchHumanHandoff({ callId, prospect, product, reason, 
   const integration = await postIntegration(url, {
     call_id: String(callId || '').slice(0, 120), prospect: String(prospect || '').slice(0, 100),
     product: String(product || '').slice(0, 120), reason: String(reason || '').slice(0, 240),
-    brief: { summary: String(brief?.summary || '').slice(0, 500), needs: String(brief?.needs || '').slice(0, 300), objections: String(brief?.objections || '').slice(0, 300), next_step: String(brief?.next_step || '').slice(0, 300) },
+    brief: { summary: String(brief?.summary || '').slice(0, 500), needs: String(brief?.needs || '').slice(0, 300), objections: String(brief?.objections || '').slice(0, 300), next_step: String(brief?.next_step || '').slice(0, 300), summary_source: brief?.summary_source === 'ai' ? 'ai' : 'transcript_fallback' },
     transcript
   }, `handoff:${String(callId || '').slice(0, 120)}`);
   const data = integration.data || {};

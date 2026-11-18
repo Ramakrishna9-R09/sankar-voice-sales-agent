@@ -9,7 +9,7 @@ A local-first, open-model voice sales agent for Indian small-business workflows.
 ```mermaid
 flowchart LR
   subgraph browser[Browser media and workspace]
-    MIC[Microphone] --> VAD[Energy VAD + pre-roll]
+    MIC[Microphone] --> VAD[Silero VAD option + energy fallback]
     VAD --> PCM[AudioWorklet · 16 kHz PCM]
     PCM -->|signed WSS audio frames| ASR[ASR gateway]
     ASR -->|partial / final transcript| UI[Live transcript + call state]
@@ -22,7 +22,7 @@ flowchart LR
 
   subgraph control[Control plane]
     API --> STAGE[Stage machine + intent]
-    STAGE --> RAG[Small lexical retrieval over approved catalog / FAQs]
+    STAGE --> RAG[Hybrid retrieval over approved catalog / FAQs]
     RAG --> LOOP[Bounded streamed tool loop]
     LOOP -->|OpenAI-compatible API| LLM[Qwen3-8B-AWQ · vLLM]
     LOOP --> GUARD[Commercial-claim filter]
@@ -37,11 +37,15 @@ flowchart LR
     ASR --> WASR[faster-whisper · Tamil / Telugu route]
     API --> TTS[IndicF5 or AI4Bharat TTS adapter]
   end
+
+  subgraph retrieval[Optional local CPU service]
+    RAG --> EMB[FastEmbed · multilingual-e5-small]
+  end
 ```
 
 The real-time media path, control plane, and durable state have separate responsibilities:
 
-- **Media path:** the browser captures the microphone, runs an adaptive acoustic VAD, resamples PCM in an AudioWorklet, and connects to a separately hosted WSS ASR gateway. This avoids placing WebSockets or GPU inference inside a Vercel function.
+- **Media path:** the browser captures the microphone, runs adaptive energy VAD by default or optional local Silero VAD, resamples PCM in an AudioWorklet, and connects to a separately hosted WSS ASR gateway. Energy VAD stays active as the fallback if Silero assets or ONNX initialization fail.
 - **Control plane:** Express handles SSE turns, Qwen-compatible chat calls, grounding, validation, webhook calls, summaries, and `/api/metrics`. It can run locally or as the existing Vercel adapter.
 - **Storage:** transcripts, call recordings, and prospect memory stay in the browser's IndexedDB/local storage. Server telemetry is process-local and never contains transcript content.
 
@@ -50,8 +54,9 @@ The real-time media path, control plane, and durable state have separate respons
 | Capability | Included path | Notes |
 |---|---|---|
 | Chat and tool use | Qwen3-8B-AWQ served by vLLM | Open weights; thinking disabled in vLLM and request chat-template settings. Model calls use the OpenAI-compatible API. |
-| English and Hindi STT | Qwen3-ASR-0.6B through its streaming API | Native streaming route. It does not list Tamil or Telugu in its supported language table. |
-| Tamil and Telugu STT | faster-whisper `small` worker | Re-decodes voiced audio periodically for revisable partials, then finalizes at end-of-utterance. This is chunked inference, not token streaming. |
+| English and Hindi STT | Qwen3-ASR-0.6B through its streaming API | Native streaming route. Hinglish uses the Hindi route, but code-switch accuracy is not established. It does not list Tamil or Telugu in its supported language table. |
+| Tamil and Telugu STT | faster-whisper `small` worker | Re-decodes voiced audio periodically for revisable partials, then finalizes at end-of-utterance. Telugu can use a dedicated `STT_WS_URL_TELUGU` route. This is chunked inference, not token streaming. |
+| Language routing | Hindi/Hinglish to Qwen; Tamil/Tanglish to Whisper; Telugu to an optional dedicated route | Set `STT_WS_URL_TELUGU` when Telugu uses a separate worker. Hinglish/Tanglish recognition still needs in-market WER measurements. |
 | Indic TTS | Included IndicF5 sentence worker | Open weights for Indic languages including Hindi, Tamil, and Telugu; requires a configured reference voice clip and its exact transcript. |
 | Indian English and Hinglish TTS | Optional AI4Bharat Indic-TTS adapter | Set `TTS_PROVIDER=ai4bharat` and point `AI4BHARAT_TTS_URL` to a separately run compatible AI4Bharat server. The upstream project lists Indian English and Hinglish voices. |
 
@@ -63,19 +68,27 @@ Qwen3-ASR supports English and Hindi but not Tamil/Telugu in its listed language
 
 ## Latency path and voice behavior
 
-1. RMS VAD uses adaptive noise floor, three-frame onset debounce, and a 420 ms hangover. A 200 ms AudioWorklet pre-roll protects initial consonants before speech is recognized.
-2. Speech frames stream to the authenticated ASR gateway. Partial text is rendered during the utterance; silence triggers finalization and an SSE agent request.
-3. The agent begins a streaming chat completion with Qwen3 thinking disabled. The first complete, policy-checked sentence is sent to the UI and starts a separate TTS request while the model continues generating later sentences.
-4. The browser plays each sentence and continues to listen. On VAD onset, it synchronously pauses playback, aborts both the SSE turn and active TTS request, and discards queued/stale text.
-5. The app records client TTFT, first audio byte, actual playback start, turn latency, STT finalization, and local barge-in reaction. The `/api/metrics` endpoint reports percentiles and the fraction of playback starts at or below the 800 ms target.
+1. The browser records the end-of-speech timestamp at the last speech frame. Energy VAD uses adaptive RMS, three-frame onset debounce, a 420 ms hangover, and 200 ms AudioWorklet pre-roll. Optional Silero VAD uses locally served ONNX assets and a 300 ms redemption window; energy VAD remains ready if initialization fails.
+2. Speech frames stream to the authenticated ASR gateway. Partial text is rendered during the utterance; the final ASR event starts an SSE agent request. `STT finalize` measures from detected speech end through the final transcript.
+3. The app measures first LLM token and first complete validated sentence from end of speech. The first sentence is sent immediately to the UI and starts a separate TTS request while the model continues generating later sentences.
+4. The browser measures the first TTS response byte and actual playback start from end of speech. On VAD onset, it synchronously pauses playback, aborts both the SSE turn and active TTS request, and discards queued/stale text.
+5. Client measurements are posted to `/api/telemetry`; `/api/metrics` reports rolling p50/p95 distributions for ASR finalization, first token, first sentence, TTS request start, first audio byte, playback start, full turn, and local barge-in reaction. Playback target attainment is reported separately from first-byte TTFAB.
 
-The speech adapters currently synthesize a whole sentence before the browser plays its WAV response. This overlaps TTS with later LLM generation, but it is **not codec-level streaming audio**. Barge-in cancels the local generation and playback request; the current metric does not measure a downstream ASR/GPU cancellation acknowledgement. Measure the target on a warm deployment with real Indian-network conditions before advertising an SLO.
+The speech adapters still synthesize one complete sentence at a time. For supported PCM16 WAV, the browser now parses response chunks and feeds them to an AudioWorklet after a 120 ms buffer, so it can begin playback before the full HTTP body has downloaded. This overlaps playback with later LLM generation and avoids full-file browser buffering; it does not make model synthesis incremental. The media-element full-buffer path remains as a compatibility fallback. IndicF5 and the configured AI4Bharat adapter render a full waveform before returning it. Groq Orpheus documents WAV as its supported response format, without a documented incremental TTS audio stream. [IndicF5 inference](https://github.com/AI4Bharat/IndicF5/blob/main/f5_tts/infer/README.md) · [Groq Orpheus TTS](https://console.groq.com/docs/text-to-speech/orpheus).
+
+Barge-in aborts the browser's LLM request and active TTS fetch, drops pending sentence audio, and sends an immediate stop command to the playback worklet. `Barge-in cancel` measures the local VAD-to-cancel reaction; `Audio stop ack` measures the worklet's stop acknowledgement. `Audio stop success ≤300 ms` is calculated for interruptions while audio is playing; its denominator is the number of playback interruptions with an acknowledgement or timeout sample. These are client/browser measurements, not downstream GPU cancellation acknowledgements.
+
+### Latency budget and how to read it
+
+The repository defines instrumentation for each segment; it does not contain a benchmark that proves a particular warm-GPU latency. In the live workspace, open **Operations → Runtime metrics**. `STT finalize` includes VAD hangover and ASR finalization; first model token (including tool-call output), first complete customer-facing sentence, first TTS byte, and playback start are all relative to the last detected speech frame. The gap between these percentiles helps locate the slow segment, but percentiles are aggregate windows and are not a per-call distributed trace. Review a warm run with at least 50 representative turns before setting a deployment target. To check interruption, speak over the agent during playback and confirm that audio stops, the transcript captures the interruption, and the Barge-in cancel metric records the local reaction time.
+
+The largest remaining warm-path costs are the 300–420 ms VAD silence/redemption window, ASR finalization (especially the re-decode Whisper path), model queueing and prompt prefill before the first token, and full-sentence TTS synthesis before the first response byte. Network RTT adds to each separate browser/control-plane/worker hop. This code has no measured hardware result to put against those budget items, so treat `VOICE_LATENCY_TARGET_MS` as an alerting/reporting threshold, not a guarantee.
 
 ## Product grounding and tools
 
 The agent stage machine covers introduction, discovery, pitch, objection handling, closing, and summary. Intent signals can move it to an objection or close without following a rigid script.
 
-Approved catalog facts, FAQs, policies, service levels, and integrations are chunked into small records and ranked with lightweight lexical relevance scoring. This is intentionally dependency-free and suitable for a small catalog; it is not an embedding model or general-purpose document ingestion pipeline. No evidence match means the assistant says it cannot verify the claim.
+Approved catalog facts, FAQs, policies, service levels, and integrations are chunked into at most 400 records of at most 900 characters. Lexical retrieval is always available. If `EMBEDDINGS_URL` is configured, the control plane builds an in-memory `intfloat/multilingual-e5-small` index in the background and combines cosine similarity with lexical relevance; the first turn never waits for that build. Query embedding has a short timeout and falls back to lexical ranking when the worker is cold or unavailable. Results are limited to five chunks. This is a small, in-memory retrieval path, not a vector database or general-purpose document ingestion pipeline. No evidence match means the assistant says it cannot verify the claim. The [FastEmbed model list](https://github.com/qdrant/fastembed#supported-models) documents the multilingual E5 model; the worker uses its `query:` / `passage:` input prefixes.
 
 Commercial-claim filtering runs before each complete sentence is sent for speech. Price/discount claims require a catalog-grounded answer or a successful validated pricing tool result. The quote tool ignores model-supplied amounts, and quantity fields cannot authorize a price. This is a deterministic safety layer with conservative false positives; it is not a formal proof that every paraphrased feature claim is true. Review blocked claims and improve the approved source data before relaxing thresholds.
 
@@ -151,6 +164,8 @@ Copy-Item .env.example .env
 docker compose --profile voice-stack up --build
 ```
 
+For the optional CPU embedding worker, set `EMBEDDINGS_URL=http://127.0.0.1:8012` in `.env` and start the Compose profile above. Without a reachable worker, calls continue with lexical retrieval. To enable neural VAD, set `VAD_PROVIDER=silero`; the browser serves the ONNX model, WASM runtime, and worklet from `public/vendor/`, which `npm install` prepares. Keep `VAD_PROVIDER=energy` for a dependency-free baseline. The [browser VAD guide](https://github.com/ricky0123/vad/blob/master/docs/user-guide/browser.md) describes the locally served asset paths.
+
 In another terminal:
 
 ```powershell
@@ -184,14 +199,16 @@ The adapter maps English, Hindi, Hinglish, Tamil, and Telugu to the correspondin
 | `INDIC_TTS_URL` | Included IndicF5 worker URL. |
 | `AI4BHARAT_TTS_URL` | Optional local AI4Bharat-compatible REST server. |
 | `STT_PROVIDER` | `streaming` for the self-hosted ASR workers; `browser` for Web Speech fallback. |
-| `STT_WS_URL_HINDI`, `STT_WS_URL_TAMIL` | Public/private `ws://` local or `wss://` deployed ASR routes. |
+| `STT_WS_URL_HINDI`, `STT_WS_URL_TAMIL`, `STT_WS_URL_TELUGU` | Public/private `ws://` local or `wss://` deployed ASR routes. Telugu falls back to the Tamil/Whisper route when unset. |
 | `VOICE_GATEWAY_SECRET` | Shared HMAC secret between Node and the ASR gateway; use a unique random secret. |
 | `PRODUCT_CATALOG_JSON`, `SALES_KNOWLEDGE_JSON` | Approved product facts and small FAQ/policy corpus. |
+| `EMBEDDINGS_URL`, `EMBEDDING_REQUEST_TIMEOUT_MS` | Optional private FastEmbed worker and per-query timeout; user queries are sent to this endpoint when configured. |
+| `VAD_PROVIDER` | `energy` by default; use `silero` to try local Silero VAD with energy fallback. |
 | `FOLLOWUP_WEBHOOK_URL`, `CRM_WEBHOOK_URL`, `ORDER_STATUS_WEBHOOK_URL`, `SUPPORT_TICKET_WEBHOOK_URL`, `HUMAN_HANDOFF_WEBHOOK_URL` | Optional HTTPS integration adapters. |
 
 ## Operator takeover and call safety
 
-A human can take control during a call, type a response for the configured TTS voice to speak, hear and see the prospect's next turns, then resume the agent. Explicit human requests trigger takeover. Repeated frustration or repeated user turns can also trigger a local operator takeover. A concise model-generated handoff brief and bounded transcript context can be sent to the configured transfer webhook; if summary generation fails, the system sends a marked fallback brief rather than blocking local takeover.
+A human can take control during a call, type a response for the configured TTS voice to speak, hear and see the prospect's next turns, then resume the agent. Explicit human requests, repeated frustration signals, repeated user turns, and disputed/complex billing language trigger local operator takeover. A concise model-generated handoff brief and bounded transcript context can be sent to the configured transfer webhook; if summary generation fails, the system sends a marked transcript-derived fallback brief rather than blocking local takeover. These triggers are conservative text patterns and are not a sentiment model.
 
 Operator messages are distinct transcript turns, are passed back to the agent as context, count as assistant speech in talk/listen ratios, and are included in call evaluation. This is a local browser operator console plus optional webhook signal, not a PSTN/SIP bridge or staffed call-center queue. A production deployment must connect it to an authenticated live agent system.
 
@@ -202,7 +219,7 @@ Recording is disabled until the operator checks the consent box. When enabled, t
 `GET /api/metrics` returns a rolling 15-minute, current-process snapshot:
 
 - LLM first-token latency, request/error counts, prompt/completion tokens, and circuit state.
-- Client-reported time to first audio byte, playback start p50/p95, the fraction of playback starts within the 800 ms target, total-turn p50/p95, STT finalize latency, and local barge-in reaction latency.
+- Client-reported STT finalize, first-token, first-sentence, TTS request-start, first audio byte (TTFAB), playback-start p50/p95, the fraction of playback starts within the configured threshold, total-turn p50/p95, and local barge-in reaction latency.
 - Call capture start/drop counts, handoff count, per-tool calls/errors/success rate/latency, and request error rates.
 - Whisper mean log probability p50 as an **uncalibrated diagnostic**, not an STT confidence probability. Qwen ASR does not currently expose a comparable value.
 
@@ -229,13 +246,13 @@ npm run eval:wer -- ./path/to/asr-samples.json
 
 The report includes corpus WER and a per-language breakdown. Keep separate test sets for English, Hindi, Hinglish, Tamil, Telugu, and any in-market code-switch pattern; do not compare languages using a single pooled score. WER is transcript quality only; it does not measure turn latency, interruption success, or sales safety.
 
-After a call, the LLM judge scores discovery, objection handling, need alignment, factuality/compliance, empathy, next-step clarity, and overall effectiveness. Call history can be rescored with the current rubric. Judge scores are useful coaching signals, not objective proof of sales quality; review a human-labeled sample and audit commercial claims.
+After a call, the LLM judge scores discovery, objection handling, need alignment, factuality/compliance, empathy, next-step clarity, and overall effectiveness. The evaluator receives the approved retrieval sources surfaced during the call and confirmed tool actions. A deterministic post-pass also flags commercial statements that fail the same conservative claim validator and highlights missing prospect evidence for need, impact, timeline, and decision process. Those flags are review prompts, not a formal hallucination detector; call history can be rescored with the current rubric, and human review remains necessary.
 
 ## Deployment and cost
 
 - **Local demo / pilot:** run the Node app near the GPU workers on a private network. Keep model ports private; expose only the HTTPS app and required WSS gateway through a TLS reverse proxy.
 - **Vercel control plane:** the existing Express adapter can host HTTP/SSE routes, but Vercel does not host the GPU models or the long-lived ASR WebSocket. Deploy the ASR/TTS/LLM services separately and set private service URLs/secrets in Vercel. Browser ASR needs a public `wss://` URL reachable by the user's browser.
-- **Cost control:** use quantized Qwen weights, small ASR model variants, bounded tool/agent loops, concurrency caps, and business-hour scheduling. The repository does not include GPU autoscaling or scale-to-zero automation. Turning a GPU off saves compute but incurs cold model-load time; warm up and measure before accepting calls.
+- **Cost control:** use quantized Qwen weights, small ASR model variants, bounded tool/agent loops, concurrency caps, and business-hour scheduling. The repository does not include GPU autoscaling or scale-to-zero automation. Keep the browser/control plane available while GPU workers sleep; a scheduled wake-up or platform idle timeout can reduce idle GPU cost, but the first call after scale-from-zero must wait for model loading. Warm the workers, run a health check, and only then enable call admission. A 16-sequence vLLM cap is a scheduling ceiling, not a promise of 16 concurrent voice calls: each call can contend for ASR, LLM, and TTS GPU memory and queue time. Load-test call mix, peak VRAM, and tail latency before setting capacity.
 - **Before customer calls:** pin model/container versions, benchmark each language and network region, load-test model memory and queueing, configure authenticated CRM/handoff receivers, add centralized telemetry, and review recording/consent/privacy requirements.
 
 ## Limits and production-readiness boundary
@@ -254,12 +271,13 @@ After a call, the LLM judge scores discovery, objection handling, need alignment
 - `server.js`: Express control plane, provider calls, SSE, speech routing, tools, summary/handoff, metrics.
 - `agent/provider.js`, `agent/speech-providers.js`: server-side model and TTS adapter selection.
 - `agent/stages.js`, `agent/prompt.js`: stage/intent logic and live system prompt.
-- `agent/knowledge.js`, `agent/guardrails.js`: approved-source retrieval and fail-closed commercial-sentence filter.
+- `agent/knowledge.js`, `agent/guardrails.js`: hybrid lexical/dense approved-source retrieval and fail-closed commercial-sentence filter.
 - `agent/tools.js`, `agent/tool-runtime.js`: schemas, server validation, bounded parallel tool execution, webhooks.
 - `agent/reliability.js`, `agent/observability.js`: retries, circuit breakers, structured logs, bounded metrics.
 - `services/qwen-asr/`: authenticated streaming ASR WebSocket gateway for Qwen3-ASR / faster-whisper.
 - `services/indic-tts/`: bounded-concurrency IndicF5 synthesis worker.
-- `public/app.js`, `public/voice-activity.js`, `public/pcm-capture-worklet.js`, `public/voice-turn.js`: live workspace, RMS VAD/streaming capture, playback, interruption.
+- `services/embeddings/`: optional CPU FastEmbed worker for multilingual dense retrieval.
+- `public/app.js`, `public/voice-activity.js`, `public/silero-vad.js`, `public/pcm-capture-worklet.js`, `public/voice-turn.js`: live workspace, energy/Silero VAD, streaming capture, playback, interruption.
 - `public/memory.js`: browser-local episodic and semantic prospect memory.
 - `eval/`, `scripts/`, `test/`: sales regression fixtures, ASR WER tool, unit tests, and replay scripts.
 - `docker-compose.yml`: optional local GPU profile.

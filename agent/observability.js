@@ -44,7 +44,7 @@ export function observeTokenUsage(kind, inputTokens, outputTokens) {
 }
 
 export function observeClientEvent(name, valueMs) {
-  if (!['time_to_first_audio_byte_ms', 'time_to_first_audio_ms', 'time_to_first_token_ms', 'turn_total_ms', 'interruption_cancel_ms', 'stt_finalize_ms', 'call_started', 'call_dropped', 'barge_in', 'handoff_auto'].includes(name)) return false;
+  if (!['time_to_first_audio_byte_ms', 'time_to_first_audio_ms', 'time_to_first_token_ms', 'first_sentence_ms', 'tts_request_start_ms', 'turn_total_ms', 'interruption_cancel_ms', 'interruption_audio_stop_ms', 'barge_in_stop_success', 'stt_finalize_ms', 'call_started', 'call_dropped', 'barge_in', 'handoff_auto', 'vad_silero_enabled', 'vad_fallback_energy'].includes(name)) return false;
   if (!Number.isFinite(valueMs) || valueMs < 0 || valueMs > 120_000) return false;
   const value = bucket(name);
   value.count += 1;
@@ -91,6 +91,7 @@ export function metricsSnapshot(circuits, provider = 'groq', speechCircuit) {
   const callStarts = windows.get('call_started')?.count || 0;
   const callDrops = windows.get('call_dropped')?.count || 0;
   const firstAudioSamples = windows.get('time_to_first_audio_ms')?.samples || [];
+  const bargeInStopResults = windows.get('barge_in_stop_success')?.samples || [];
   const configuredAudioTarget = Number(process.env.VOICE_LATENCY_TARGET_MS);
   const firstAudioTargetMs = Number.isFinite(configuredAudioTarget) && configuredAudioTarget >= 100 && configuredAudioTarget <= 5000 ? configuredAudioTarget : 800;
   const sttLogProbability = percentileValue(windows.get('stt_mean_log_probability')?.samples || [], 0.5);
@@ -106,16 +107,23 @@ export function metricsSnapshot(circuits, provider = 'groq', speechCircuit) {
       time_to_first_token_ms: snapshotBucket(windows.get('time_to_first_token_ms') || { count: 0, errors: 0, samples: [], input_tokens: 0, output_tokens: 0 }),
       time_to_first_audio_byte_ms: snapshotBucket(windows.get('time_to_first_audio_byte_ms') || empty),
       time_to_first_audio_ms: snapshotBucket(windows.get('time_to_first_audio_ms') || { count: 0, errors: 0, samples: [], input_tokens: 0, output_tokens: 0 }),
+      first_sentence_ms: snapshotBucket(windows.get('first_sentence_ms') || empty),
+      tts_request_start_ms: snapshotBucket(windows.get('tts_request_start_ms') || empty),
       first_audio_target_ms: firstAudioTargetMs,
       first_audio_target_attainment: firstAudioSamples.length ? Number((firstAudioSamples.filter((sample) => sample <= firstAudioTargetMs).length / firstAudioSamples.length).toFixed(3)) : null,
       turn_total_ms: snapshotBucket(windows.get('turn_total_ms') || empty),
       interruption_cancel_ms: snapshotBucket(windows.get('interruption_cancel_ms') || empty),
+      interruption_audio_stop_ms: snapshotBucket(windows.get('interruption_audio_stop_ms') || empty),
+      barge_in_success_rate: bargeInStopResults.length ? Number((bargeInStopResults.filter((sample) => sample >= 1).length / bargeInStopResults.length).toFixed(3)) : null,
+      barge_in_success_samples: bargeInStopResults.length,
       stt_finalize_ms: snapshotBucket(windows.get('stt_finalize_ms') || empty),
       call_starts: callStarts,
       call_drops: callDrops,
       call_drop_rate: callStarts ? Number((callDrops / callStarts).toFixed(3)) : 0,
       barge_in_count: windows.get('barge_in')?.count || 0,
-      automatic_handoff_count: windows.get('handoff_auto')?.count || 0
+      automatic_handoff_count: windows.get('handoff_auto')?.count || 0,
+      silero_vad_calls: windows.get('vad_silero_enabled')?.count || 0,
+      energy_vad_fallbacks: windows.get('vad_fallback_energy')?.count || 0
     },
     stt: { mean_log_probability_p50: sttLogProbability == null ? null : Number(sttLogProbability.toFixed(3)), scored_utterances: windows.get('stt_mean_log_probability')?.count || 0, confidence_note: 'Whisper mean log probability is a diagnostic signal, not calibrated confidence; Qwen ASR does not currently expose a comparable score.' },
     tools: Object.fromEntries(Object.entries(tools).map(([name, entry]) => [name, { calls: entry.calls, errors: entry.errors, success_rate: entry.calls ? Number(((entry.calls - entry.errors) / entry.calls).toFixed(3)) : 0, p50_ms: percentile(entry.samples, 0.5) }])),

@@ -18,14 +18,18 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
         this.flush();
       } else if (!data.active) {
         this.active = false;
-        this.flush();
+        // Flush the final sub-100 ms tail before acknowledging end-of-utterance.
+        // The main thread sends ASR `end` only after this acknowledgement, so the
+        // gateway cannot finalize before the last PCM frame arrives.
+        this.flush(true);
+        this.port.postMessage({ type: 'speech-flushed' });
       }
     };
   }
 
-  flush() {
-    while (this.samples.length >= this.samplesPerChunk) {
-      const batch = this.samples.splice(0, this.samplesPerChunk);
+  flush(final = false) {
+    while (this.samples.length >= this.samplesPerChunk || (final && this.samples.length)) {
+      const batch = this.samples.splice(0, Math.min(this.samples.length, this.samplesPerChunk));
       const pcm = new Int16Array(batch.length);
       for (let i = 0; i < batch.length; i += 1) pcm[i] = Math.max(-32768, Math.min(32767, Math.round(batch[i] * (batch[i] < 0 ? 32768 : 32767))));
       this.port.postMessage(pcm.buffer, [pcm.buffer]);

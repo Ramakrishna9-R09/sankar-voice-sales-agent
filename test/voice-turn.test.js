@@ -8,10 +8,12 @@ test('barge-in aborts LLM and TTS, clears queued speech, and drops stale partial
   const partial = { role: 'assistant', content: 'unfinished sentence' };
   let paused = false;
   let removedSource = false;
+  let stoppedWorklet = false;
   const state = {
     speaking: true, thinking: true, speechGeneration: 4, speechQueue: [{ text: 'next sentence' }], autoEndCall: true,
     turnController: llm, speechController: tts, streamMessage: partial, messages: [partial],
-    audioElement: { pause() { paused = true; }, removeAttribute(name) { removedSource = name === 'src'; } }
+    audioElement: { pause() { paused = true; }, removeAttribute(name) { removedSource = name === 'src'; } },
+    playbackNode: { port: { postMessage(message) { stoppedWorklet = message.type === 'stop'; } } }
   };
   let renders = 0;
   assert.equal(cancelVoiceGeneration(state, () => { renders += 1; }), true);
@@ -22,5 +24,6 @@ test('barge-in aborts LLM and TTS, clears queued speech, and drops stale partial
   assert.equal(state.messages.length, 0);
   assert.equal(renders, 1);
   assert.equal(paused && removedSource, true);
+  assert.equal(stoppedWorklet, true);
   assert.equal(cancelVoiceGeneration(state), false);
 });

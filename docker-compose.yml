@@ -82,5 +82,17 @@ services:
     gpus: all
     restart: unless-stopped
 
+  embeddings:
+    build: ./services/embeddings
+    profiles: [voice-stack]
+    environment:
+      EMBEDDING_MODEL: intfloat/multilingual-e5-small
+    ports:
+      - "127.0.0.1:8012:8012"
+    volumes:
+      - embeddings-cache:/root/.cache/fastembed
+    restart: unless-stopped
+
 volumes:
   hf-cache:
+  embeddings-cache:

@@ -20,5 +20,6 @@ export function cancelVoiceGeneration(state, rerender = () => {}) {
     state.audioElement.pause();
     state.audioElement.removeAttribute('src');
   }
+  state.playbackNode?.port.postMessage({ type: 'stop' });
   return true;
 }
